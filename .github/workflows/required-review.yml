@@ -1,13 +1,20 @@
 # Load-bearing-minimum tier: the two agent-loop gates that keep quality holding
 # when the senior is away — multi-persona review and the outcome-eval ship gate.
 # Scaffolded by `harness init --level load-bearing-minimum`, then hardened; the
-# two deviations from the scaffold are marked HARDENED below and are deliberate,
+# deviations from the scaffold are marked HARDENED below and are deliberate,
 # so a future `harness init` that overwrites them is a regression, not an update.
 #
 # Both jobs run `pull_request` against `main`. Edit `branches:` if your default
 # branch differs, and `--block-on` to change the severity that fails the check.
-# The heuristic floor of both gates runs on any runner; the LLM tier activates
-# only when an API-key secret is present, degrading gracefully otherwise.
+#
+# The API key is OPTIONAL, and the workflow is honest about what that costs.
+# The heuristic floor of both gates runs on any runner. The LLM tier activates
+# only when `ANTHROPIC_API_KEY` is present. Without it, `harness review-ci`
+# exits 0 with `ranLlmTier: false` — a green tick that reviewed nothing, which
+# is the exact false-green shape this repo exists to name (#17). So each job
+# reads the verdict it produced and says, in the job summary and as a workflow
+# annotation, whether a review actually ran. The check stays green either way;
+# what it will not do is let "floor-only" look identical to "reviewed".
 #
 # The trigger is `pull_request`, never `pull_request_target`: a fork PR then
 # receives no secrets at all, so the LLM tier degrades to its heuristic floor on
@@ -31,16 +38,25 @@ jobs:
         with:
           # Full history so the PR base branch is reachable for the diff range.
           fetch-depth: 0
+      # The base ref goes through `env`, never straight into the command line.
+      # `branches: [main]` already constrains it, but a workflow expression
+      # expanded into a shell string is the injection shape regardless of who
+      # can reach it today — and branch filters get edited.
       - name: Fetch PR base branch
-        run: git fetch origin ${{ github.base_ref }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch origin "$BASE_REF"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       # HARDENED (1/2): pinned exactly, not floated to `latest`. An unpinned
       # global install is a third party's newest publish running on our runner;
       # pinned, an upgrade is a reviewable diff instead of a silent event. Bump
-      # deliberately — 11.3.0 is the version these gates were validated against.
-      - run: npm install -g @harness-engineering/cli@11.3.0
+      # deliberately, and keep it equal to the version the local rot-watch
+      # tracks — two gates on different CLI builds make a disagreement between
+      # them unattributable (#18). 12.6.0 is the version these gates were
+      # validated against.
+      - run: npm install -g @harness-engineering/cli@12.6.0
       - name: Multi-persona review gate
         # HARDENED (2/2): the secrets live on this step, not on the job. The
         # scaffold put them in job-level `env`, which handed all five to
@@ -53,7 +69,42 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           HARNESS_LOCAL_ENDPOINT: ${{ secrets.HARNESS_LOCAL_ENDPOINT }}
           HARNESS_LOCAL_MODEL: ${{ secrets.HARNESS_LOCAL_MODEL }}
-        run: harness review-ci --runner claude --block-on request-changes --diff "origin/${{ github.base_ref }}...HEAD"
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          harness review-ci --runner claude --block-on request-changes \
+            --diff "origin/$BASE_REF...HEAD" --out review-verdict.json
+
+      # A zero denominator is an abstention, not a pass. The gate above exits 0
+      # when it never ran its LLM tier; this step is what stops that exit code
+      # from being the whole story. It does not change the check's colour — the
+      # key is optional by design — it changes what the colour is allowed to
+      # claim. A missing verdict file is the one case that fails: then the gate
+      # did not even reach the floor, and nothing was measured at all.
+      - name: Say whether a review actually ran
+        if: always()
+        run: |
+          set -eu
+          if [ ! -f review-verdict.json ]; then
+            echo "::error::review-ci produced no verdict — the gate did not run. Abstention, not a pass."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          v = json.load(open("review-verdict.json"))
+          ran = bool(v.get("ranLlmTier"))
+          n = len(v.get("findings") or [])
+          b = len(v.get("blockingFindings") or [])
+          line = (f"reviewed — LLM tier ran; {n} finding(s), {b} blocking"
+                  if ran else
+                  f"FLOOR-ONLY — LLM tier did not run ({v.get('skipReason') or 'no reason given'}); "
+                  f"{n} heuristic finding(s), {b} blocking. This green is not a review. See #17.")
+          print(line)
+          if not ran:
+              print(f"::warning title=required-review ran floor-only::{line}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### required-review\n\n{line}\n\n"
+                      f"assessment: `{v.get('assessment')}` · runner: `{v.get('runner')}` · exitCode: `{v.get('exitCode')}`\n")
+          PY
 
   outcome-eval:
     name: outcome-eval
@@ -62,18 +113,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The base ref goes through `env`, never straight into the command line.
+      # `branches: [main]` already constrains it, but a workflow expression
+      # expanded into a shell string is the injection shape regardless of who
+      # can reach it today — and branch filters get edited.
       - name: Fetch PR base branch
-        run: git fetch origin ${{ github.base_ref }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch origin "$BASE_REF"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       # HARDENED (1/2): see the note in `required-review`. Keep both pins on the
-      # same version — two gates running different CLI builds would make a
-      # disagreement between them unattributable.
-      - run: npm install -g @harness-engineering/cli@11.3.0
+      # same version.
+      - run: npm install -g @harness-engineering/cli@12.6.0
       - name: Outcome-eval ship gate
         # Judges the change against its spec; blocks only on a high-confidence
-        # NOT_SATISFIED. Auto-discovers the spec from the diff.
+        # NOT_SATISFIED. Auto-discovers the spec from the diff. With no spec or
+        # no key it degrades to an advisory INCONCLUSIVE and exits 0 — the step
+        # below keeps that from reading as "satisfied".
         # HARDENED (2/2): step-scoped secrets, as above.
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -81,4 +139,27 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           HARNESS_LOCAL_ENDPOINT: ${{ secrets.HARNESS_LOCAL_ENDPOINT }}
           HARNESS_LOCAL_MODEL: ${{ secrets.HARNESS_LOCAL_MODEL }}
-        run: harness outcome-eval-ci --block-on blocking --diff "origin/${{ github.base_ref }}...HEAD"
+          BASE_REF: ${{ github.base_ref }}
+        # `pipefail` is not optional here. The runner's default shell is
+        # `bash -e`, where a pipeline reports the *last* command's status — so
+        # piping the gate through `tee` would hand the job tee's exit 0 and
+        # silently disarm the only step that can block a ship.
+        run: |
+          set -euo pipefail
+          harness outcome-eval-ci --block-on blocking \
+            --diff "origin/$BASE_REF...HEAD" | tee outcome-eval.md
+      - name: Say what the verdict was
+        if: always()
+        run: |
+          set -eu
+          if [ ! -s outcome-eval.md ]; then
+            echo "::error::outcome-eval produced no output — the gate did not run. Abstention, not a pass."
+            exit 1
+          fi
+          verdict=$(grep -oE 'INCONCLUSIVE|NOT_SATISFIED|SATISFIED' outcome-eval.md | head -1 || true)
+          case "$verdict" in
+            SATISFIED) echo "outcome-eval: SATISFIED" ;;
+            *) echo "::warning title=outcome-eval is advisory only::verdict=${verdict:-none} — this green is not a spec-satisfaction pass. See #17."
+               echo "outcome-eval: ${verdict:-no verdict} (advisory)" ;;
+          esac
+          { echo "### outcome-eval"; echo; cat outcome-eval.md; } >> "$GITHUB_STEP_SUMMARY"
