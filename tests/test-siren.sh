@@ -209,6 +209,68 @@ OUT=$(run_siren)
 assert_has "across 1 check(s)" "$OUT" "coverage warning does not increment CHECKS_RUN"
 teardown
 
+# ── 15. local AHEAD of cache is not rot, and must never suggest a downgrade ──
+# The comparison used to be a bare string inequality, so `local != cached` was
+# read as "upstream published something newer" REGARDLESS of direction. Upgrade a
+# watched CLI and the siren announced a "newer release" naming the OLDER version
+# and told you to install it. The window lasts up to the full TTL — i.e. the whole
+# day after a user does exactly the right thing. Worse than a missed finding: the
+# remediation actively reverts a good upgrade, and it trains the user to ignore
+# the siren right when it is loudest.
+setup
+config '{"watch":[{"cli":"mycli","npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.3.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_not "newer release published" "$OUT" "local ahead of cache → not a rot finding"
+assert_not "mypkg@6.3.0" "$OUT" "  never prescribes installing the older version"
+teardown
+
+# ── 16. local ahead proves the cache is wrong — refresh regardless of TTL ────
+# A fresh TTL normally means "trust the cache, touch nothing". But a local version
+# ahead of the cached registry answer is direct evidence the cached answer is out
+# of date, which outranks the clock. Without this the wrong value simply sits
+# there until the TTL expires.
+setup
+config '{"watch":[{"cli":"mycli","npm":"mypkg","npm_ttl_hours":24}]}'
+cache "{\"mypkg\":{\"latest\":\"6.3.0\",\"checked\":\"$(hours_ago 1)\"}}"
+run_siren >/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do npm_called && break; sleep 0.3; done
+npm_called && ok "local ahead → refresh dispatched despite a fresh TTL" \
+           || bad "local ahead → refresh dispatched" "npm invoked in background" "npm never called"
+teardown
+
+# ── 17. the ordinary drift finding must still fire (no over-correction) ──────
+# Guard against "fixing" case 15 by muting the comparison outright.
+setup
+config '{"watch":[{"cli":"mycli","npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.9.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "newer release published" "$OUT" "local behind → drift finding still fires"
+assert_has "mypkg@6.9.0" "$OUT" "  remediation names the NEWER version"
+teardown
+
+# ── 18. a non-semver version falls back to inequality, never to silence ─────
+# Some CLIs report a build string or a git describe. Unparseable must degrade to
+# the old behaviour (report the difference) rather than being treated as "equal"
+# and going quiet — that would convert a parse gap into a false green.
+setup
+config '{"watch":[{"cli":"mycli","npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"nightly-abc123\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+[ -n "$OUT" ] && ok "unparseable version → still reports, does not go silent" \
+              || bad "unparseable version → still reports" "a finding" "(silent)"
+teardown
+
+# ── 19. --refresh-npm-cache with no packages is a usage error, not a no-op ───
+# `for PKG in "$@"` over an empty list exits 0 having done nothing, so a mistyped
+# invocation looked like a successful refresh. In a hook whose whole job is to
+# refuse silent success, that exit code is the bug.
+setup
+OUT=$(bash "$SIREN" --refresh-npm-cache 2>&1); RC=$?
+[ "$RC" -ne 0 ] && ok "refresh with no packages → non-zero exit (usage error)" \
+                || bad "refresh with no packages → non-zero exit" "non-zero" "exit $RC: $OUT"
+teardown
+
 # ── report ───────────────────────────────────────────────────────────────────
 printf '\n  %s────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 if [ "$FAIL" -eq 0 ]; then

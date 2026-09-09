@@ -37,6 +37,14 @@ CHECKS_RUN=0
 # moment — a half-written cache would read as corrupt and fire a false finding.
 if [ "${1:-}" = "--refresh-npm-cache" ]; then
   shift
+  # `for PKG in "$@"` over an empty list exits 0 having done nothing, so a
+  # mistyped invocation used to look like a successful refresh. In a hook whose
+  # entire purpose is refusing silent success, that is the bug.
+  if [ "$#" -eq 0 ]; then
+    printf 'usage: %s --refresh-npm-cache <npm-package> [<npm-package>...]\n' \
+      "$(basename "$0")" >&2
+    exit 2
+  fi
   for PKG in "$@"; do
     VER=$(npm view "$PKG" version 2>/dev/null </dev/null | tr -d '[:space:]')
     [ -n "$VER" ] || continue
@@ -61,6 +69,38 @@ EOF
   done
   exit 0
 fi
+
+# version_cmp <local> <latest> → -1 (local behind) | 0 (same) | 1 (local ahead)
+#                               | __NC__ (not comparable: either side unparseable)
+#
+# Compares dot-separated numeric components, longest wins on a tie-break of
+# equal prefixes (6.4 < 6.4.1). A pre-release/build suffix (-rc.1, +build) is
+# dropped before comparison, so 6.5.0-rc.1 compares as 6.5.0 — deliberately
+# coarse: this decides whether to NAG, not what to install, and treating an rc
+# as its release keeps the siren quiet for someone deliberately running one.
+#
+# Anything that does not parse returns __NC__ so the caller can fall back to a
+# plain inequality rather than guessing a direction.
+version_cmp() {
+  python3 - "$1" "$2" <<'EOF'
+import re, sys
+
+def parse(v):
+    v = v.strip().lstrip("vV").split("+")[0].split("-")[0]
+    if not v or not re.fullmatch(r"\d+(\.\d+)*", v):
+        return None
+    return [int(p) for p in v.split(".")]
+
+a, b = parse(sys.argv[1]), parse(sys.argv[2])
+if a is None or b is None:
+    print("__NC__")
+else:
+    n = max(len(a), len(b))
+    a += [0] * (n - len(a))
+    b += [0] * (n - len(b))
+    print(-1 if a < b else (1 if a > b else 0))
+EOF
+}
 
 emit() {
   # emit <systemMessage-body>
@@ -230,9 +270,31 @@ EOF
       AGE_NOTE=""
       [ "$IS_STALE" = "1" ] && AGE_NOTE=" (cache ${CACHE_AGE}h old — stale, refresh dispatched)"
 
+      # Direction matters. This was a bare `!=`, so ANY difference read as
+      # "upstream published something newer" — including local being AHEAD,
+      # which is the normal state for up to a full TTL after an upgrade. The
+      # siren then named the OLDER version and told the user to install it,
+      # reverting a good upgrade. See `version_cmp`: -1 behind, 0 same, 1 ahead,
+      # __NC__ when either side will not parse.
+      VER_CMP=$(version_cmp "$LOCAL_VER" "$NPM_LATEST")
+
       if [ "$LOCAL_VER" = "unknown" ]; then
         FINDINGS+=("$LABEL: npm latest is $NPM_LATEST but local version — cannot verify (no cli or marketplace version to compare)$AGE_NOTE")
-      elif [ "$LOCAL_VER" != "$NPM_LATEST" ]; then
+      elif [ "$VER_CMP" = "1" ]; then
+        # Local is NEWER than the cached registry answer. That is not rot — it
+        # is proof the CACHE is wrong, which outranks a fresh TTL, so refresh
+        # regardless of the clock and stay quiet. Reporting here would be a
+        # false finding on healthy tooling, and the remediation would be a
+        # downgrade.
+        case " ${NEED_REFRESH[*]:-} " in
+          *" $NPM_PKG "*) : ;;
+          *) NEED_REFRESH+=("$NPM_PKG") ;;
+        esac
+      elif [ "$VER_CMP" = "-1" ] || { [ "$VER_CMP" = "__NC__" ] && [ "$LOCAL_VER" != "$NPM_LATEST" ]; }; then
+        # Behind, or unparseable-and-different. Unparseable falls back to the
+        # old inequality on purpose: a version this script cannot parse must
+        # still be REPORTED, never silently treated as equal, or a parse gap
+        # becomes a false green.
         FINDINGS+=("$LABEL: newer release published — local $LOCAL_VER vs npm latest $NPM_LATEST (npm i -g $NPM_PKG@$NPM_LATEST)$AGE_NOTE")
       elif [ "$IS_STALE" = "1" ]; then
         # Versions agree, but on data old enough that agreement proves little.
