@@ -140,7 +140,8 @@ The repo ships executable tests — run them all against the working copy:
 | `test-siren.sh` | 22 | abstention path, field-shift regressions, npm drift, partial coverage, the no-network-on-the-hot-path contract |
 | `test-nudge.sh` | 19 | intent-vs-evidence, compound-command failures, both firing conditions, sidechain isolation |
 | `test-statusline.sh` | 17 | last-record-not-sum, billing weights, colour thresholds, truncated-line survival |
-| `test-drift.sh` | 30 | expected-vs-real difference on the `@import` line, missing/orphaned files, machine-local exclusions, the abstention exit code, the read-only contract (see §7) |
+| `test-drift.sh` | 41 | expected-vs-real difference on the `@import` line, missing/orphaned files, machine-local exclusions, the abstention exit code, the exec-bit check, the read-only contract (see §7) |
+| `test-bare-install.sh` | 34 | exit 0 not the exit-2 abstention, the tool's own denominator, disclosure on both paths, the drift-artifact resolver, a caller-supplied root surviving both paths |
 
 Every bug that has escaped these hooks has a case there. `run-all.sh` treats
 **zero matched suites as a failure**, not a pass — a runner that globs, matches
@@ -353,7 +354,7 @@ it by hand against §5 instead.
 - [ ] The agent can state rule 3 as "always do TDD" — proves the `@import` of
       `~/.config/ai-rules/global.md` resolved rather than failing silently
 - [ ] The siren smoke-test above printed the empty-watchlist finding
-- [ ] `./tests/run-all.sh` reports 4 suites, all clean
+- [ ] `./tests/run-all.sh` reports 5 suites, all clean
 - [ ] The statusline renders a bar, a percentage, and a `burn` figure on a new
       session — a *blank* statusline means the hook died, and blank is
       indistinguishable from 0%
