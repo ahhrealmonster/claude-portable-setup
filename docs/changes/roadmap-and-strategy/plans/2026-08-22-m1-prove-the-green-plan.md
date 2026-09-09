@@ -832,7 +832,7 @@ file. This is also the first moment `actionlint`'s absence could bite.
 **[checkpoint:decision]** **[checkpoint:human-action]**
 
 This creates real, public, permanent artifacts in
-`ahhrealmonstr/claude-portable-setup`. It is never a silent automated step.
+`ahhrealmonster/claude-portable-setup`. It is never a silent automated step.
 
 1. **[checkpoint:decision]** Confirm granularity before creating anything:
 
@@ -849,7 +849,7 @@ This creates real, public, permanent artifacts in
 
 2. **[checkpoint:human-action]** Get an explicit yes before the first
    `gh issue create`. Then, under C:
-   `gh api repos/ahhrealmonstr/claude-portable-setup/milestones -f title='M2 — One core, three OSes'` (and M3, M4).
+   `gh api repos/ahhrealmonster/claude-portable-setup/milestones -f title='M2 — One core, three OSes'` (and M3, M4).
 3. For each of the 13 items, create the issue with a body that links **both
    ways**: the roadmap row ID, `ROADMAP.md`, the spec section, and the exit
    criterion. Example for M2-1:
@@ -916,21 +916,29 @@ required registration and it cannot be done from a workflow file.
 1. **[checkpoint:human-action]** The human enables branch protection on `main`
    (Settings → Branches → Add rule), or authorizes the API call:
    ```
-   gh api -X PUT repos/ahhrealmonstr/claude-portable-setup/branches/main/protection \
-     -H "Accept: application/vnd.github+json" \
-     -f 'required_status_checks[strict]=true' \
-     -f 'required_status_checks[contexts][]=gates-complete' \
-     -f 'enforce_admins=false' \
-     -f 'required_pull_request_reviews=null' \
-     -f 'restrictions=null'
+   echo '{"required_status_checks":{"strict":true,"contexts":["gates-complete"]},
+          "enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}' \
+   | gh api -X PUT repos/ahhrealmonster/claude-portable-setup/branches/main/protection \
+       -H "Accept: application/vnd.github+json" --input -
    ```
+   The body goes in as JSON, not as `-f` pairs. `-f` sends every value as a
+   *string*, and this endpoint requires real booleans and nulls — the `-f`
+   form returns `422 "true" is not a boolean` and changes nothing. Corrected
+   after it failed exactly that way on 2026-09-09.
+
+   Use the **canonical owner name**. `ahhrealmonstr` was renamed to
+   `ahhrealmonster` and the old name has since been deleted. GitHub follows
+   renames on GET, so reads against a stale name keep working and look healthy;
+   a PUT returns `307 Moved Permanently`, which `gh api` will not follow for
+   write methods, so the write silently lands nowhere. That is the failure
+   shape this repo exists to name, arriving through the URL.
    Require **`gates-complete` only**, not the individual legs: it is the job
    that verifies each leg actually ran, and requiring a matrix leg by name
    breaks the moment `windows-latest` joins in M2. Requiring the legs *instead*
    of the aggregate would also mean a skipped leg shows as neutral rather than
    failing.
 2. Verify it took, rather than assuming:
-   `gh api repos/ahhrealmonstr/claude-portable-setup/branches/main/protection -q '.required_status_checks.contexts'`
+   `gh api repos/ahhrealmonster/claude-portable-setup/branches/main/protection -q '.required_status_checks.contexts'`
    → must list `gates-complete`. An empty list here is the zero denominator.
 3. **[checkpoint:human-verify]** Confirm on the open PR that `gates-complete` is
    now labelled **Required**.
