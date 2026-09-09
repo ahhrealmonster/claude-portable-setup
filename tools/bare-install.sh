@@ -28,7 +28,16 @@ STATUS=0
 
 # OWNED_TMP is the whole reason the cleanup trap is safe: it fires only for a
 # root this script created. A caller-supplied path is never removed.
+#
+# An empty argument is refused rather than resolved: ROOT="" would turn the
+# mkdir and cp below into "/.claude/hooks" and "/.claude/CLAUDE.md" — an
+# install into the filesystem root, from a tool whose header promises to touch
+# nothing of the user's. macOS's read-only / only made that fail by luck.
 if [ "$#" -ge 1 ]; then
+  if [ -z "$1" ]; then
+    printf '✘ refusing an empty root path: "" would resolve to /, not to a scratch home\n' >&2
+    exit 1
+  fi
   ROOT="$1"
   OWNED_TMP=0
 else
@@ -63,6 +72,14 @@ cp "$BUNDLE"/home/hooks/*            "$ROOT/.claude/hooks/"
 # hook fails to execute — so the session silently loses that hook's coverage.
 # Scoped to *.sh because rot-watch.example.json ships 0644 on purpose.
 chmod +x "$ROOT"/.claude/hooks/*.sh
+
+# The tool's own denominator. check-drift prints "N check(s)" of its own, but a
+# count borrowed from the verifier says nothing about the install: with the
+# checker stubbed out (or silent) the run would state no number at all. This
+# is what the tool placed, counted after the fact rather than tallied from the
+# cp lines above, so a copy that silently failed is not counted as done.
+INSTALLED=$(find "$ROOT" -type f | wc -l | tr -d ' ')
+printf 'installed %s file(s) into %s\n' "$INSTALLED" "$ROOT"
 
 # Deliberately NOT installed: settings.json (§5) and the memory/ seeds (§6).
 # The drift check does not compare either — the template ships an empty
