@@ -48,6 +48,11 @@ starts.
   pin buried in an `mcpServers` args array diverges from a floating local CLI
   with all four other checks green. `pin_npm` needs a `plugin` key to locate the
   manifest, and reports when it matches nothing rather than passing quietly.
+- **A version hardcoded in a repo file is watched with `pin_files`.** Same rot,
+  different hiding place: `pin_npm` reaches a plugin manifest through its
+  `installPath` and so cannot see a CI workflow. Point a glob at the files
+  (`~` expands). A glob matching zero files is a finding — otherwise renaming a
+  directory retires the check silently, which is the zero denominator again.
 
 If the siren fires, surface it in the first message of the session and treat it
 as outranking new work — then **put it to the user as an `AskUserQuestion`

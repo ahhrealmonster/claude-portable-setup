@@ -135,8 +135,10 @@ EOF
 #   npm             npm package name; cached registry latest vs installed version
 #   npm_ttl_hours   how old the cached registry answer may get (default 24)
 #   npm_exempt      true = this cli is deliberately not npm-checked (see check 6)
-#   pin_npm         npm package this PLUGIN hardcodes in its own manifest; the
-#                   pin is compared to the registry latest (check 5)
+#   pin_npm         npm package a hardcoded version is watched for (check 5)
+#   pin_files       extra file globs to scan for that pin, beyond the plugin
+#                   manifest — CI workflows, Dockerfiles, anything tracking a
+#                   version by hand. ~ expands to $HOME. (check 5)
 WATCH=$(python3 - "$CONFIG" <<'EOF'
 import json, sys
 try:
@@ -155,6 +157,7 @@ for w in cfg.get("watch", []):
         w.get("npm", ""), str(w.get("npm_ttl_hours", 24)),
         "true" if w.get("npm_exempt") else "false",
         w.get("pin_npm", ""),
+        "\x1e".join(w.get("pin_files") or []),
     ]))
 EOF
 )
@@ -181,9 +184,12 @@ fi
 # Read on FD 3, not stdin: children spawned in the loop body inherit stdin and
 # can consume it. Keeping the watchlist on its own descriptor makes the loop
 # structurally immune to that, regardless of what a watched command does.
-while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM; do
-  [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG$PIN_NPM" ] && continue
-  LABEL="${PLUGIN:-${CLI:-${MKT_NAME:-$NPM_PKG}}}"
+while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM PIN_FILES; do
+  [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG$PIN_NPM$PIN_FILES" ] && continue
+  # PIN_NPM last in the chain: an entry that watches only pinned files has no
+  # plugin, cli, marketplace or npm key, and an empty label renders as a bare
+  # "- :" that names nothing.
+  LABEL="${PLUGIN:-${CLI:-${MKT_NAME:-${NPM_PKG:-$PIN_NPM}}}}"
   MKT="$CLAUDE_DIR/plugins/marketplaces/$MKT_NAME"
   PLUGIN_VER="unknown"
   CLI_VER="unknown"   # hoisted: the npm check below needs it even if no cli key
@@ -306,26 +312,59 @@ EOF
     fi
   fi
 
-  # 5. Manifest pin skew. Checks 1-4 look at what the machine INSTALLED; none of
-  #    them reads what a plugin hardcodes inside its own manifest. A plugin that
-  #    embeds `pkg@1.2.3` in an mcpServers command line keeps spawning 1.2.3
-  #    forever while the machine's own CLI floats to latest — and every other
-  #    check stays green, because every other check is looking somewhere else.
+  # 5. Hardcoded-version skew. Checks 1-4 look at what the machine INSTALLED;
+  #    none of them reads a version something has written down by hand. A pin
+  #    keeps its value forever while everything around it floats to latest, and
+  #    every other check stays green because every other check is looking
+  #    somewhere else.
   #
-  #    Not hypothetical: harness-claude pins @harness-engineering/cli at an exact
-  #    version in its MCP args while this machine's mise pin tracks `latest`. The
-  #    two agreed on the day the plugin was installed and silently diverge on the
-  #    next release, with nothing anywhere reporting it.
+  #    Two places carry such a pin, and they need separate scans because they are
+  #    found in completely different ways:
+  #      5a  a PLUGIN MANIFEST, reached through the plugin's recorded installPath
+  #      5b  ordinary FILES named by a glob — CI workflows, Dockerfiles, scripts
   #
-  #    The pin is buried in an args array, not a top-level field, so this scans
-  #    the manifest TEXT for `<pkg>@<version>` rather than reading a known key.
+  #    The registry answer is resolved once here and shared, so an entry watching
+  #    both does not read the cache twice or dispatch two refreshes.
+  PIN_LATEST="__NONE__"
+  PIN_NOTE=""
   if [ -n "$PIN_NPM" ]; then
+    PIN_CACHED=$(python3 - "$CACHE" "$PIN_NPM" <<'EOF'
+import json, sys, datetime as d
+try:
+    entry = json.load(open(sys.argv[1]))[sys.argv[2]]
+    checked = d.datetime.strptime(entry["checked"], "%Y-%m-%dT%H:%M:%SZ") \
+               .replace(tzinfo=d.timezone.utc)
+    age_h = (d.datetime.now(d.timezone.utc) - checked).total_seconds() / 3600
+    print("%s\x1f%.1f" % (entry["latest"], age_h))
+except Exception:
+    print("__NONE__")
+EOF
+)
+    if [ "$PIN_CACHED" != "__NONE__" ]; then
+      IFS=$'\x1f' read -r PIN_LATEST PIN_AGE <<< "$PIN_CACHED"
+      PIN_STALE=$(python3 -c "print(1 if $PIN_AGE > ${NPM_TTL:-24} else 0)" 2>/dev/null || echo 0)
+      if [ "$PIN_STALE" = "1" ]; then
+        NEED_REFRESH+=("$PIN_NPM")
+        PIN_NOTE=" (cache ${PIN_AGE}h old — stale, refresh dispatched)"
+      fi
+    fi
+  fi
+
+  # 5a. The pin inside a plugin's own manifest. Not hypothetical: harness-claude
+  #     pins @harness-engineering/cli at an exact version in its mcpServers args
+  #     while this machine's mise pin tracks `latest`. They agree on install day
+  #     and diverge silently on the next release.
+  #
+  #     The pin is buried in an args array, not a top-level field, so this scans
+  #     the manifest TEXT for `<pkg>@<version>` rather than reading a known key.
+  #
+  #     Skipped without complaint when pin_files is set: watching repo files and
+  #     no plugin is a legitimate configuration, and demanding a bogus `plugin`
+  #     key to reach the check would be a misconfiguration of our own making.
+  if [ -n "$PIN_NPM" ] && { [ -n "$PLUGIN" ] || [ -z "$PIN_FILES" ]; }; then
     CHECKS_RUN=$((CHECKS_RUN + 1))
     if [ -z "$PLUGIN" ]; then
-      # The manifest is located through the plugin's recorded installPath, so
-      # pin_npm alone has nothing to read. Skipping quietly would be coverage
-      # that was declared and never delivered.
-      FINDINGS+=("$LABEL: pin_npm '$PIN_NPM' needs a 'plugin' key to locate the manifest; pin NOT checked")
+      FINDINGS+=("$LABEL: pin_npm '$PIN_NPM' needs a 'plugin' key to locate the manifest (or a 'pin_files' glob); pin NOT checked")
     else
       PIN_VER=$(python3 - "$CLAUDE_DIR/plugins/installed_plugins.json" "$PLUGIN" "$PIN_NPM" <<'EOF'
 import json, re, sys
@@ -361,41 +400,96 @@ EOF
           # check has been silently inert). Both need a human; neither is a pass.
           FINDINGS+=("$LABEL: no pin for '$PIN_NPM' found in the plugin manifest — pin_npm is watching nothing; drop the key or fix the package name") ;;
         *)
-          PIN_CACHED=$(python3 - "$CACHE" "$PIN_NPM" <<'EOF'
-import json, sys, datetime as d
-try:
-    entry = json.load(open(sys.argv[1]))[sys.argv[2]]
-    checked = d.datetime.strptime(entry["checked"], "%Y-%m-%dT%H:%M:%SZ") \
-               .replace(tzinfo=d.timezone.utc)
-    age_h = (d.datetime.now(d.timezone.utc) - checked).total_seconds() / 3600
-    print("%s\x1f%.1f" % (entry["latest"], age_h))
-except Exception:
-    print("__NONE__")
-EOF
-)
-          if [ "$PIN_CACHED" = "__NONE__" ]; then
+          if [ "$PIN_LATEST" = "__NONE__" ]; then
             FINDINGS+=("$LABEL: pin '$PIN_NPM@$PIN_VER' — cannot verify (no cached registry data yet; refresh dispatched)")
             NEED_REFRESH+=("$PIN_NPM")
           else
-            IFS=$'\x1f' read -r PIN_LATEST PIN_AGE <<< "$PIN_CACHED"
-            PIN_STALE=$(python3 -c "print(1 if $PIN_AGE > ${NPM_TTL:-24} else 0)" 2>/dev/null || echo 0)
-            [ "$PIN_STALE" = "1" ] && NEED_REFRESH+=("$PIN_NPM")
-            PIN_NOTE=""
-            [ "$PIN_STALE" = "1" ] && PIN_NOTE=" (cache ${PIN_AGE}h old — stale, refresh dispatched)"
-            # Same direction rule as check 4: a pin AHEAD of the cached answer
-            # proves the cache is stale, not that the plugin rotted. Reporting it
-            # would advise a downgrade.
+            # Direction matters, as in check 4: a pin AHEAD of the cached answer
+            # proves the CACHE is wrong, not the plugin. Reporting it would
+            # prescribe a downgrade.
             PIN_CMP=$(version_cmp "$PIN_VER" "$PIN_LATEST")
-            if [ "$PIN_CMP" = "1" ]; then
-              case " ${NEED_REFRESH[*]:-} " in
-                *" $PIN_NPM "*) : ;;
-                *) NEED_REFRESH+=("$PIN_NPM") ;;
-              esac
-            elif [ "$PIN_CMP" = "-1" ] || { [ "$PIN_CMP" = "__NC__" ] && [ "$PIN_VER" != "$PIN_LATEST" ]; }; then
+            if [ "$PIN_CMP" = "-1" ] || { [ "$PIN_CMP" = "__NC__" ] && [ "$PIN_VER" != "$PIN_LATEST" ]; }; then
               FINDINGS+=("$LABEL: plugin manifest pins $PIN_NPM@$PIN_VER but npm latest is $PIN_LATEST — the plugin will keep spawning the pinned version; update the plugin or repin it$PIN_NOTE")
-            elif [ "$PIN_STALE" = "1" ]; then
-              FINDINGS+=("$LABEL: pin check is stale — cache ${PIN_AGE}h old, cannot confirm $PIN_NPM@$PIN_VER is still current (refresh dispatched)")
+            elif [ -n "$PIN_NOTE" ]; then
+              FINDINGS+=("$LABEL: pin check is stale — cache too old to confirm $PIN_NPM@$PIN_VER is still current (refresh dispatched)")
             fi
+          fi ;;
+      esac
+    fi
+  fi
+
+  # 5b. The same pin, in files the plugin machinery cannot see. A version tracked
+  #     by hand in a CI workflow, a Dockerfile, or a install script is the same
+  #     rot as a manifest pin, and nothing above reaches it: check 5a finds the
+  #     manifest through the plugin's installPath, so a repo file is structurally
+  #     invisible to it.
+  #
+  #     Found by reviewing #16: required-review.yml pinned the harness CLI at
+  #     12.6.0 in two places while the plugin manifest, the local install, and the
+  #     registry were all on 12.7.0 — and the pin's own adjacent comment declared
+  #     the invariant it was breaking (#22).
+  if [ -n "$PIN_FILES" ]; then
+    CHECKS_RUN=$((CHECKS_RUN + 1))
+    if [ -z "$PIN_NPM" ]; then
+      FINDINGS+=("$LABEL: pin_files is set but needs a 'pin_npm' key naming the package to look for; nothing was scanned")
+    else
+      # Emits one "version\x1fpath" line per DISTINCT (path, version) pair, so a
+      # package pinned twice at the same version in one file is one finding, not
+      # two — two findings for one edit is the noise that stops a siren being read.
+      PIN_HITS=$(python3 - "$PIN_NPM" "$PIN_FILES" <<'EOF'
+import glob, os, re, sys
+pkg, spec = sys.argv[1], sys.argv[2]
+pat = re.compile(re.escape(pkg) + r"@(\d[A-Za-z0-9.\-+]*)")
+matched, seen, out = False, set(), []
+for g in spec.split("\x1e"):
+    if not g:
+        continue
+    for path in sorted(glob.glob(os.path.expanduser(g))):
+        if not os.path.isfile(path):
+            continue
+        matched = True
+        try:
+            text = open(path, errors="replace").read()
+        except Exception:
+            continue
+        for ver in pat.findall(text):
+            key = (path, ver)
+            if key not in seen:
+                seen.add(key)
+                out.append("%s\x1f%s" % (ver, path))
+if not matched:
+    print("__NOMATCH__")          # a glob matching nothing checked nothing
+elif not out:
+    print("__NOPIN__")            # files read, package absent from all of them
+else:
+    print("\n".join(out))
+EOF
+)
+      case "$PIN_HITS" in
+        __NOMATCH__)
+          # The zero denominator, in the shape this hook was written for: rename a
+          # workflow directory and the check retires itself with no sign it did.
+          FINDINGS+=("$LABEL: pin_files matched no files, so the '$PIN_NPM' pin was NOT checked — fix the glob or drop the key") ;;
+        __NOPIN__)
+          FINDINGS+=("$LABEL: no pin for '$PIN_NPM' found in any file matched by pin_files — the key is watching nothing; drop it or fix the package name") ;;
+        *)
+          if [ "$PIN_LATEST" = "__NONE__" ]; then
+            FINDINGS+=("$LABEL: pins for '$PIN_NPM' found in files but — cannot verify (no cached registry data yet; refresh dispatched)")
+            NEED_REFRESH+=("$PIN_NPM")
+          else
+            # `~` as a literal, via a variable: a backslash-escaped tilde in a
+            # ${var/#pat/repl} replacement stays a backslash, and an unquoted one
+            # would expand right back to $HOME.
+            TILDE='~'
+            while IFS=$'\x1f' read -r FV FP; do
+              [ -z "$FV" ] && continue
+              # Same direction rule as 4 and 5a: a pin AHEAD of the cached answer
+              # means the cache is stale, not that the file rotted.
+              FCMP=$(version_cmp "$FV" "$PIN_LATEST")
+              if [ "$FCMP" = "-1" ] || { [ "$FCMP" = "__NC__" ] && [ "$FV" != "$PIN_LATEST" ]; }; then
+                FINDINGS+=("$LABEL: ${FP/#$HOME/$TILDE} pins $PIN_NPM@$FV but npm latest is $PIN_LATEST — update the pin (re-validate against it, never bump blind)$PIN_NOTE")
+              fi
+            done <<< "$PIN_HITS"
           fi ;;
       esac
     fi

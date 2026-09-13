@@ -86,6 +86,7 @@ empty **will** report itself — coverage was intended and isn't there.
 | `npm` | installed version vs the registry's `latest` | **cached only** |
 | `npm_exempt` | *declares* that a `cli` is deliberately not npm-checked | no |
 | `pin_npm` | a version this **plugin hardcodes in its own manifest** vs the registry's `latest` | **cached only** |
+| `pin_files` | the same pin, in **files you name with a glob** — CI workflows, Dockerfiles, scripts | **cached only** |
 
 `pin_npm` covers a blind spot the others share: they all inspect what the
 machine *installed*. A plugin can hardcode `some-pkg@1.2.3` inside an
@@ -98,6 +99,32 @@ It needs a `plugin` key to find the manifest (via the recorded `installPath`),
 and it reports rather than skips in all three ways it can come up empty: no such
 plugin, no readable manifest, or no pin matching that package name. A `pin_npm`
 watching nothing is declared coverage that was never delivered.
+
+`pin_files` covers the *other* place a version gets written by hand, which the
+manifest scan structurally cannot reach: an ordinary repo file.
+
+```json
+{
+  "pin_npm": "@harness-engineering/cli",
+  "pin_files": ["~/Github/my-repo/.github/workflows/*.yml"]
+}
+```
+
+`~` expands to `$HOME`. Each distinct file-and-version pair is reported once, so
+a package pinned twice at the same version in one file is one finding rather than
+two — but two files pinned at *different* versions are two findings, because
+fixing one would otherwise leave the other looking handled.
+
+Two ways it can come up empty, both reported:
+
+- **The glob matched no files.** Rename a workflow directory and the check
+  retires itself; without this it would look exactly like a glob that matched a
+  clean file. This is the zero denominator in its purest form.
+- **Files matched, but none mentions the package.** Either the pin was removed
+  (drop the key) or the package name is wrong (the check has been inert).
+
+`pin_files` needs a `pin_npm` naming what to look for, but it does **not** need a
+`plugin` key — a repo's CI pins are nobody's plugin.
 
 The first three compare local things to each other, so a machine can be
 perfectly self-consistent and still be a year behind the registry. `npm` closes
