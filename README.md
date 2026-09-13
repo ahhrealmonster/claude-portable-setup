@@ -36,7 +36,20 @@ skipped file stays behind the bundle silently.
 | `home/settings.template.json` | merge into `~/.claude/settings.json` | Model, effort, theme, notifications, empty-by-design permissions, plugin list, statusline + hook wiring |
 | `home/memory/` | `~/.claude/projects/<project>/memory/` | Seed memories: the visual-learner fact, and the two-file rules split (which file is a symlink and which is not) |
 | `tools/check-drift.sh` | — | Read-only check that what's deployed still matches what's here. Exit 2 for "nothing installed" is distinct from exit 0 on purpose |
-| `tests/` | — | Executable regression tests for the three hooks and the drift check (99 cases). `./tests/run-all.sh` |
+| `tools/bare-install.sh` | — | Carries out `INSTALL.md` §§1–4 into a scratch `$HOME` and proves the install landed: exit 0, never the exit-2 abstention. Names the two targets it does not verify, pass or fail |
+| `.github/workflows/ci.yml` | — | The four gates on `ubuntu-latest` and `macos-latest`, plus an aggregate job that fails when a leg was *skipped* rather than run |
+| `tests/` | — | Executable regression tests for the three hooks, the drift check, and the bare install (133 cases across 5 suites). `./tests/run-all.sh` |
+
+## Where it's going
+
+[`STRATEGY.md`](STRATEGY.md) states what this repo is, who it serves, and what
+it refuses to become — durable positions only. [`ROADMAP.md`](ROADMAP.md) lists
+every remaining item with the exit criterion that closes it and the issue that
+tracks it. A row there is "done" only when its issue is closed by a merged
+commit, which is why neither file carries a progress bar.
+
+The short version: one public core that works on a bare machine, with anything
+situational layered on top of it as an overlay — never a fork.
 
 ## The two ideas worth keeping even if you drop the rest
 

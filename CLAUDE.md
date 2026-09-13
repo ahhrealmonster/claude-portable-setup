@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+For *what this repo is for* and *what is left*, read [`STRATEGY.md`](STRATEGY.md)
+(durable positions) and [`ROADMAP.md`](ROADMAP.md) (items, exit criteria, and the
+issue tracking each). This file is the how-to-work-here map; those two are the
+why and the what-next.
+
 ## What this repo is
 
 A **portable bundle of a Claude Code working setup** — not an application. It has
@@ -25,18 +30,23 @@ clone, which makes deploying it pointless.
 ## Commands
 
 ```bash
-./tests/run-all.sh          # every suite (99 cases across 4)
-./tests/test-siren.sh       # or one suite at a time
+./tests/run-all.sh            # every suite (133 cases across 5)
+./tests/test-siren.sh         # or one suite at a time
 ./tests/test-nudge.sh
 ./tests/test-statusline.sh
 ./tests/test-drift.sh
+./tests/test-bare-install.sh
 ```
 
 There is no test framework and no single-case filter — a suite is a flat bash
 script of `ok`/`bad` assertions. To run one case, comment out the others or add a
 temporary early `exit`.
 
-The four gates for this repo (no CI; run them by hand before a PR):
+The four gates for this repo. Run them by hand before a PR *and* they run in
+CI — `.github/workflows/ci.yml` executes this same list on `ubuntu-latest` and
+`macos-latest`. Keep the two in step: the workflow copies these commands
+verbatim, and a gate that exists in only one of the two places is how the
+documented gates and the enforced gates drift apart.
 
 ```bash
 bash -n home/hooks/*.sh tools/*.sh tests/*.sh         # syntax
@@ -44,8 +54,16 @@ shellcheck home/hooks/*.sh tools/*.sh                # lint — clean at default
 shellcheck -S warning tests/*.sh                     # suites carry known SC2015 infos
 python3 -m json.tool home/settings.template.json     # JSON parses
 python3 -m json.tool home/hooks/rot-watch.example.json
+python3 -m json.tool harness.config.json
 ./tests/run-all.sh                                   # test
 ```
+
+`gates-complete` is the aggregate job and the one to require on `main` — it is
+what verifies each leg actually *ran*, so requiring the individual matrix legs
+instead would let a skipped leg show as neutral, and would break the moment
+`windows-latest` joins in M2. **A workflow without branch protection is
+decorative**: until `gates-complete` is a required check, every gate here is
+still advisory.
 
 The suites use `[ cond ] && ok ... || bad ...` deliberately (the assertion
 helpers are total), which shellcheck flags as SC2015 *info*. Hooks must stay
@@ -98,6 +116,36 @@ context-instruments section and still named private-marketplace skills that
 `EXCLUDED.md` had stripped. Nothing surfaced it, because a stale rules file
 loads, parses, and reads as authoritative exactly like a current one.
 
+### Bare install — proving a stranger's clone works
+
+`check-drift.sh` compares an install that already exists. Nothing proved the
+*act* of installing still works, and every suite here runs against a synthetic
+root the test itself populated — so all of them would pass on a bundle whose
+install spec had quietly stopped working.
+
+```bash
+./tools/bare-install.sh            # scratch root, cleaned up
+./tools/bare-install.sh /tmp/probe # your root, left in place
+```
+
+It carries out `INSTALL.md` §§1–4 into a scratch `$HOME`, then runs the drift
+check against *that* root and demands **exit 0 specifically**. Exit 2 is the
+trap: it is check-drift's "nothing of the bundle is installed here, so nothing
+was compared" abstention, and a job accepting any non-1 status would go green on
+an install that copied zero files. The report would be indistinguishable from a
+real pass.
+
+Like the drift check, **its green is partial and says so**: it installs and
+verifies §§1–4 and never touches `settings.json` (§5) or the `memory/` seeds
+(§6), so it names those two on every path — pass *and* fail.
+
+The suite runs every invocation with `HOME` pointed at an empty scratch
+directory. That is not tidiness: `check-drift.sh` falls back to `$HOME` when
+`CHECK_ROOT` is unset, so deleting the one line that sets it made the whole
+suite pass 23/23 while verifying the author's real, in-sync install instead of
+the scratch one. A suite that passes on any machine that has already run
+`INSTALL.md` is precisely the false green this repo exists to name.
+
 ## The idea the whole repo encodes
 
 **A zero denominator is an abstention, not a pass.** Every artifact here is a
@@ -135,6 +183,11 @@ These are pinned by tests; breaking them is how the escaped defects escaped.
 | The drift check never writes | `check-drift.sh` | Auto-repair would destroy the evidence of how far behind the machine had drifted, which is the actual finding |
 | The uncovered targets print on **both** the pass and fail paths | `check-drift.sh` | `settings.json` and `memory/` are never compared; a bare "in sync" claims coverage the check does not have, and disclosing only on green would imply a red run's findings were exhaustive |
 | Deployed `*.sh` are checked for `+x`, scoped to `.sh` | `check-drift.sh` | A hook without the exec bit never runs and Claude Code says nothing, so it is indistinguishable from a hook that ran clean. Scoped because `rot-watch.example.json` ships 0644 on purpose and demanding `+x` on data files would make a correct install permanently red |
+| `bare-install` treats exit **2** as a failure | `tools/bare-install.sh` | Exit 2 is check-drift's "nothing was installed here" abstention. A job accepting any non-1 status would certify an install that copied zero files, and the report would look exactly like a real pass |
+| The bare-install suite pins `HOME` to an empty directory | `tests/test-bare-install.sh` | `check-drift.sh` falls back to `$HOME` when `CHECK_ROOT` is unset, so dropping the one line that sets it left the suite passing 23/23 against the author's real install. Mutation-tested: with `HOME` empty the same edit fails 6 cases |
+| The tool states its **own** file count, never the checker's | `tools/bare-install.sh` | A denominator borrowed from check-drift's "N check(s)" disappears the moment the checker is stubbed or silent, leaving a run that installed nothing and said nothing |
+| The aggregate job fails on **skipped**, not only on failure | `.github/workflows/ci.yml` | A required check that never ran shows as neutral and a zero-leg matrix shows as skipped; both read as not-red. `if: always()` is load-bearing, and the job id must stay `bare_install` because `needs.bare-install.result` parses as a subtraction |
+| The review gate says when it ran floor-only | `.github/workflows/required-review.yml` | Without an API key `review-ci` exits 0 with `ranLlmTier: false` — a green tick that reviewed nothing. The key stays optional; the check is not allowed to claim a review it did not perform (#17) |
 
 ## Conventions specific to this repo
 

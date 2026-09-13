@@ -1,0 +1,134 @@
+# The repo's four gates, run by something other than a human's memory.
+#
+# Until now these gates lived in CLAUDE.md as a list you were trusted to type
+# before opening a PR. A gate you have to remember to run is not a gate, and the
+# repo's own history is the argument: home/CLAUDE.md sat 7h ahead of its
+# deployed copy after #3 and #7 with every surface reporting fine.
+#
+# Its thesis is that a gate nobody ran is not a pass, so this workflow is
+# written against its own failure mode: a leg that never ran, a glob that
+# matched nothing, a missing shellcheck quietly reducing four gates to three.
+# The commands themselves are copied verbatim from CLAUDE.md's "Commands"
+# section — this file must never invent a different set, or the documented
+# gates and the enforced gates drift apart.
+name: gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: four gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false   # a cancelled sibling must not hide a leg's result
+      matrix:
+        os: [ubuntu-latest, macos-latest]   # windows-latest joins in M2
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # "Cannot verify" is a finding, not a skip. shellcheck is preinstalled on
+      # the ubuntu runner and absent on macOS; without this step the macOS leg
+      # would fail with a confusing "command not found" mid-gate, or worse, a
+      # future `|| true` would turn four gates into three and still report green.
+      - name: preflight — cannot verify is a finding, not a skip
+        run: |
+          set -eu
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install shellcheck; fi
+          fi
+          command -v shellcheck >/dev/null || {
+            echo "::error::shellcheck absent on $RUNNER_OS — the lint gate cannot run"; exit 1; }
+          command -v python3 >/dev/null || {
+            echo "::error::python3 absent — the JSON gate cannot run"; exit 1; }
+          shellcheck --version; python3 --version; bash --version | head -1
+
+      # A zero denominator is an abstention, not a pass. Every gate below is a
+      # glob, and a glob that matches nothing succeeds loudly and silently:
+      # `bash -n` with no arguments exits 0. This is the step that makes an
+      # emptied directory a red run instead of the fastest green in history.
+      - name: denominator — every gate must have something to check
+        run: |
+          set -eu
+          h=$(ls home/hooks/*.sh   2>/dev/null | wc -l | tr -d ' ')
+          t=$(ls tools/*.sh        2>/dev/null | wc -l | tr -d ' ')
+          s=$(ls tests/test-*.sh   2>/dev/null | wc -l | tr -d ' ')
+          echo "hooks=$h tools=$t suites=$s"
+          for n in "$h" "$t" "$s"; do
+            [ "$n" -gt 0 ] || { echo "::error::a gate matched zero files — abstention, not a pass"; exit 1; }
+          done
+
+      - name: gate 1 — syntax
+        run: bash -n home/hooks/*.sh tools/*.sh tests/*.sh
+
+      - name: gate 2 — shellcheck, default severity
+        run: shellcheck home/hooks/*.sh tools/*.sh
+
+      # Suites carry known SC2015 infos: `[ cond ] && ok ... || bad ...` is
+      # deliberate there because the assertion helpers are total. Hooks and
+      # tools stay clean at default severity; only the suites are gated here.
+      - name: gate 2b — suites at -S warning (known SC2015 infos)
+        run: shellcheck -S warning tests/*.sh
+
+      - name: gate 3 — JSON parses
+        run: |
+          set -eu
+          python3 -m json.tool home/settings.template.json      > /dev/null
+          python3 -m json.tool home/hooks/rot-watch.example.json > /dev/null
+          python3 -m json.tool harness.config.json               > /dev/null
+
+      - name: gate 4 — tests
+        run: ./tests/run-all.sh
+
+  # Job id is bare_install, NOT bare-install. GitHub expression syntax reads
+  # `needs.bare-install.result` as a subtraction, so a hyphen here makes the
+  # aggregate job below silently evaluate the wrong thing — a false green in
+  # the very job that exists to prevent false greens.
+  bare_install:
+    name: bare install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: carry out INSTALL.md into a scratch HOME and prove it landed
+        # SC-3: exit 0, never the exit-2 abstention — an install that copied
+        # zero files would leave the drift check with nothing to compare, and
+        # a job accepting any non-1 status would certify exactly that.
+        # SC-4: the script names what it did not verify, on pass and on fail.
+        run: ./tools/bare-install.sh
+
+  gates-complete:
+    name: gates-complete
+    # always() so a skipped or cancelled dependency still reaches this job.
+    # Without it, this job would itself be skipped — and a skipped required
+    # check is exactly the abstention-wearing-a-pass shape it exists to catch.
+    if: always()
+    needs: [gates, bare_install]
+    runs-on: ubuntu-latest
+    steps:
+      - name: a skipped leg is not a pass
+        env:
+          GATES: ${{ needs.gates.result }}
+          BARE: ${{ needs.bare_install.result }}
+        run: |
+          set -u
+          rc=0
+          for pair in "gates:$GATES" "bare_install:$BARE"; do
+            name=${pair%%:*}; res=${pair#*:}
+            case "$res" in
+              success) printf '  ok       %s\n' "$name" ;;
+              skipped) printf '::error::%s was SKIPPED — zero legs ran. Abstention, not a pass.\n' "$name"; rc=1 ;;
+              '')      printf '::error::%s reported no result at all.\n' "$name"; rc=1 ;;
+              *)       printf '::error::%s reported %s.\n' "$name" "$res"; rc=1 ;;
+            esac
+          done
+          printf '  matrix legs required: ubuntu-latest, macos-latest (windows-latest lands in M2)\n'
+          exit "$rc"

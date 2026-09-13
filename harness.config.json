@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "name": "claude-portable-setup",
+  "layers": [
+    {
+      "name": "hooks",
+      "pattern": "home/hooks/**",
+      "allowedDependencies": []
+    },
+    {
+      "name": "tools",
+      "pattern": "tools/**",
+      "allowedDependencies": []
+    },
+    {
+      "name": "tests",
+      "pattern": "tests/**",
+      "allowedDependencies": [
+        "hooks",
+        "tools"
+      ]
+    }
+  ],
+  "forbiddenImports": [
+    {
+      "from": "home/hooks/**",
+      "disallow": [
+        "tools/**",
+        "tests/**"
+      ],
+      "message": "A deployed hook runs from ~/.claude with no clone present, so it can never reach tools/ or tests/ — those exist only in the bundle."
+    },
+    {
+      "from": "tools/**",
+      "disallow": [
+        "home/hooks/**"
+      ],
+      "message": "tools/ operates on an install by reading it as data; sourcing a hook would execute the thing under inspection."
+    }
+  ],
+  "architecture": {
+    "enabled": true,
+    "baselinePath": ".harness/arch/baselines.json",
+    "thresholds": {
+      "circular-deps": {
+        "max": 0
+      },
+      "layer-violations": {
+        "max": 0
+      },
+      "forbidden-imports": {
+        "max": 0
+      },
+      "complexity": {
+        "max": 15
+      },
+      "coupling": {
+        "maxFanIn": 15,
+        "maxFanOut": 12
+      },
+      "module-size": {
+        "maxFiles": 40,
+        "maxLoc": 4000
+      },
+      "dependency-depth": {
+        "max": 8
+      }
+    }
+  },
+  "agentsMapPath": "./AGENTS.md",
+  "docsDir": "./docs",
+  "security": {
+    "enabled": true,
+    "strict": false,
+    "exclude": [
+      "**/.harness/**",
+      "**/.remember/**"
+    ]
+  },
+  "entropy": {
+    "excludePatterns": [
+      "**/.harness/**",
+      "**/.remember/**"
+    ],
+    "autoFix": false
+  },
+  "performance": {
+    "complexity": {
+      "enabled": true,
+      "thresholds": {
+        "cyclomaticComplexity": {
+          "error": 15,
+          "warn": 10
+        }
+      }
+    },
+    "coupling": {
+      "enabled": true,
+      "thresholds": {
+        "fanOut": {
+          "warn": 12
+        }
+      }
+    }
+  },
+  "template": {
+    "level": "load-bearing-minimum",
+    "version": 1
+  }
+}
