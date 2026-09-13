@@ -85,6 +85,19 @@ empty **will** report itself — coverage was intended and isn't there.
 | `cli` | on PATH, and `--version` vs the plugin version | no |
 | `npm` | installed version vs the registry's `latest` | **cached only** |
 | `npm_exempt` | *declares* that a `cli` is deliberately not npm-checked | no |
+| `pin_npm` | a version this **plugin hardcodes in its own manifest** vs the registry's `latest` | **cached only** |
+
+`pin_npm` covers a blind spot the others share: they all inspect what the
+machine *installed*. A plugin can hardcode `some-pkg@1.2.3` inside an
+`mcpServers` command line and keep spawning 1.2.3 forever while your own CLI
+floats to `latest` — with every other check green, because every other check is
+looking somewhere else. The pin lives in an args array rather than a named
+field, so the check scans the manifest text for `<package>@<version>`.
+
+It needs a `plugin` key to find the manifest (via the recorded `installPath`),
+and it reports rather than skips in all three ways it can come up empty: no such
+plugin, no readable manifest, or no pin matching that package name. A `pin_npm`
+watching nothing is declared coverage that was never delivered.
 
 The first three compare local things to each other, so a machine can be
 perfectly self-consistent and still be a year behind the registry. `npm` closes

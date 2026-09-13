@@ -32,7 +32,8 @@ Auto-escalate one level for genuinely high-stakes calls; never auto-linger.
 `~/.claude/hooks/tooling-rot-siren.sh` runs at SessionStart and is the mechanical
 half of shared rule 2 (denominator check). It watches for degraded local tooling
 — a plugin installed but not enabled, a stale marketplace checkout, CLI-vs-plugin
-version skew — before any work starts.
+version skew, a plugin manifest pinning a stale npm version — before any work
+starts.
 
 - Config: `~/.claude/hooks/rot-watch.json` (template: `rot-watch.example.json`).
 - **No config = silent by design.** Nothing was asked for, so nothing is claimed.
@@ -42,6 +43,11 @@ version skew — before any work starts.
   silently skips it, so a half-covered watchlist would otherwise look identical
   to a full one. Declare `"npm_exempt": true` if the CLI genuinely isn't
   published; silence is earned by declaring the gap, never by omitting the key.
+- **A plugin that hardcodes a version in its own manifest is watched with
+  `pin_npm`.** Every other check reads what the machine installed, so an exact
+  pin buried in an `mcpServers` args array diverges from a floating local CLI
+  with all four other checks green. `pin_npm` needs a `plugin` key to locate the
+  manifest, and reports when it matches nothing rather than passing quietly.
 
 If the siren fires, surface it in the first message of the session and treat it
 as outranking new work — then **put it to the user as an `AskUserQuestion`
