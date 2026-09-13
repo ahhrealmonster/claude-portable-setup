@@ -271,6 +271,135 @@ OUT=$(bash "$SIREN" --refresh-npm-cache 2>&1); RC=$?
                 || bad "refresh with no packages → non-zero exit" "non-zero" "exit $RC: $OUT"
 teardown
 
+# ── fixture: an installed plugin whose manifest pins an npm package ─────────
+# Mirrors the real shape: installed_plugins.json carries the installPath, and
+# the manifest at that path embeds the pin inside an mcpServers args array.
+# The pin is NOT a top-level field anywhere — it is buried in a command line,
+# which is exactly why nothing was watching it.
+plugin_with_pin() {
+  local id="$1" pin="$2" dir="$HOME/.claude/plugins/cache/mkt/plug/0.1.0"
+  mkdir -p "$dir/.claude-plugin"
+  python3 - "$HOME/.claude/plugins/installed_plugins.json" "$id" "$dir" <<'EOF'
+import json, sys
+p, pid, d = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {"version": 2, "plugins": {pid: [{"scope": "user", "version": "0.1.0",
+                                        "installPath": d}]}}
+json.dump(cfg, open(p, "w"))
+EOF
+  python3 - "$dir/.claude-plugin/plugin.json" "$pin" <<'EOF'
+import json, sys
+json.dump({"name": "plug", "version": "0.1.0",
+           "mcpServers": {"plug": {"command": "npx",
+                                   "args": ["-y", "-p", sys.argv[2], "plug-mcp"]}}},
+          open(sys.argv[1], "w"))
+EOF
+  printf '{"enabledPlugins":{"%s":true}}' "$id" > "$HOME/.claude/settings.json"
+}
+
+# ── 20. a manifest pin behind npm latest is rot the other checks cannot see ──
+# The case this was built for: a plugin hardcodes `pkg@12.7.0` inside an mcpServers
+# args array while the machine's own CLI floats to latest. Checks 1-4 all pass —
+# plugin installed, enabled, checkout fresh, CLI current — because not one of them
+# reads the manifest. The skew is invisible until something calls the stale surface.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.4.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "pin" "$OUT" "manifest pin behind latest → finding"
+assert_has "6.4.0" "$OUT" "  finding names the pinned version"
+assert_has "6.5.0" "$OUT" "  finding names the published version"
+teardown
+
+# ── 21. a pin that is current must be silent ────────────────────────────────
+# Over-reporting here would fire on every session for a correctly-pinned plugin,
+# and an unconditional warning is one nobody reads.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.5.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "pin == npm latest → silent" \
+              || bad "pin == npm latest → silent" "empty output" "$OUT"
+teardown
+
+# ── 22. a pin AHEAD of the cache is not rot (same direction rule as check 4) ─
+# Upgrading the plugin before the TTL expires must not be read as rot and must
+# never produce a "downgrade to the older version" remediation.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.6.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_not "pin" "$OUT" "pin ahead of cache → no rot finding (no downgrade advice)"
+teardown
+
+# ── 23. pin_npm declared but the package is nowhere in the manifest ─────────
+# Declared coverage that finds nothing is the false-green shape this whole hook
+# exists to catch: it must report, never quietly succeed at checking nothing.
+setup
+plugin_with_pin "plug@mkt" "otherpkg@1.0.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "no pin for 'mypkg'" "$OUT" "pin_npm matching nothing → reports, never silent"
+teardown
+
+# ── 24. pin_npm on a plugin whose manifest cannot be read ───────────────────
+# Cannot-verify is a finding, not a skip.
+setup
+printf '{"version":2,"plugins":{"plug@mkt":[{"scope":"user","version":"0.1.0","installPath":"/nonexistent"}]}}' \
+  > "$HOME/.claude/plugins/installed_plugins.json"
+printf '{"enabledPlugins":{"plug@mkt":true}}' > "$HOME/.claude/settings.json"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "cannot verify" "$OUT" "unreadable manifest → cannot-verify finding"
+teardown
+
+# ── 25. the pin check needs npm data, and says so when it has none ──────────
+# Without a cached registry answer there is nothing to compare the pin against.
+# It must report that and dispatch a refresh, exactly like check 4.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.4.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+OUT=$(run_siren)
+assert_has "cannot verify" "$OUT" "pin check with no cache → cannot-verify, not silence"
+teardown
+
+# ── 26. the pin check counts in the denominator ─────────────────────────────
+# It is a real check that really ran, so unlike the coverage COMPLAINT in check 5
+# it must increment CHECKS_RUN. Entry has plugin + pin_npm = 2 checks.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.4.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "across 2 check(s)" "$OUT" "pin check increments CHECKS_RUN"
+teardown
+
+# ── 27. a fresh cache must not touch the network on the pin path either ─────
+# Same contract as case 6. A new check that shells out to npm would reintroduce
+# SessionStart latency through the back door.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.4.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+run_siren >/dev/null
+npm_called && bad "pin path → zero network calls" "npm never invoked" "$(cat "$TMP/npm-calls")" \
+           || ok "pin path → zero network calls (hot path stays local)"
+teardown
+
+# ── 28. pin_npm without a plugin key cannot locate a manifest ───────────────
+# The manifest is found via the plugin's installPath, so pin_npm alone is a
+# misconfiguration. Silently skipping it would be declared-but-absent coverage.
+setup
+config '{"watch":[{"cli":"mycli","npm":"mypkg","pin_npm":"mypkg"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.4.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "needs a 'plugin'" "$OUT" "pin_npm without plugin → misconfiguration finding"
+teardown
+
 # ── report ───────────────────────────────────────────────────────────────────
 printf '\n  %s────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 if [ "$FAIL" -eq 0 ]; then

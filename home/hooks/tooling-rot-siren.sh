@@ -134,7 +134,9 @@ EOF
 #   stale_days      freshness threshold for the marketplace checkout (default 14)
 #   npm             npm package name; cached registry latest vs installed version
 #   npm_ttl_hours   how old the cached registry answer may get (default 24)
-#   npm_exempt      true = this cli is deliberately not npm-checked (see check 5)
+#   npm_exempt      true = this cli is deliberately not npm-checked (see check 6)
+#   pin_npm         npm package this PLUGIN hardcodes in its own manifest; the
+#                   pin is compared to the registry latest (check 5)
 WATCH=$(python3 - "$CONFIG" <<'EOF'
 import json, sys
 try:
@@ -152,6 +154,7 @@ for w in cfg.get("watch", []):
         w.get("cli", ""), str(w.get("stale_days", 14)),
         w.get("npm", ""), str(w.get("npm_ttl_hours", 24)),
         "true" if w.get("npm_exempt") else "false",
+        w.get("pin_npm", ""),
     ]))
 EOF
 )
@@ -178,8 +181,8 @@ fi
 # Read on FD 3, not stdin: children spawned in the loop body inherit stdin and
 # can consume it. Keeping the watchlist on its own descriptor makes the loop
 # structurally immune to that, regardless of what a watched command does.
-while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT; do
-  [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG" ] && continue
+while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM; do
+  [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG$PIN_NPM" ] && continue
   LABEL="${PLUGIN:-${CLI:-${MKT_NAME:-$NPM_PKG}}}"
   MKT="$CLAUDE_DIR/plugins/marketplaces/$MKT_NAME"
   PLUGIN_VER="unknown"
@@ -303,7 +306,102 @@ EOF
     fi
   fi
 
-  # 5. Coverage honesty about the watchlist ITSELF. Checks 1-4 report on what
+  # 5. Manifest pin skew. Checks 1-4 look at what the machine INSTALLED; none of
+  #    them reads what a plugin hardcodes inside its own manifest. A plugin that
+  #    embeds `pkg@1.2.3` in an mcpServers command line keeps spawning 1.2.3
+  #    forever while the machine's own CLI floats to latest — and every other
+  #    check stays green, because every other check is looking somewhere else.
+  #
+  #    Not hypothetical: harness-claude pins @harness-engineering/cli at an exact
+  #    version in its MCP args while this machine's mise pin tracks `latest`. The
+  #    two agreed on the day the plugin was installed and silently diverge on the
+  #    next release, with nothing anywhere reporting it.
+  #
+  #    The pin is buried in an args array, not a top-level field, so this scans
+  #    the manifest TEXT for `<pkg>@<version>` rather than reading a known key.
+  if [ -n "$PIN_NPM" ]; then
+    CHECKS_RUN=$((CHECKS_RUN + 1))
+    if [ -z "$PLUGIN" ]; then
+      # The manifest is located through the plugin's recorded installPath, so
+      # pin_npm alone has nothing to read. Skipping quietly would be coverage
+      # that was declared and never delivered.
+      FINDINGS+=("$LABEL: pin_npm '$PIN_NPM' needs a 'plugin' key to locate the manifest; pin NOT checked")
+    else
+      PIN_VER=$(python3 - "$CLAUDE_DIR/plugins/installed_plugins.json" "$PLUGIN" "$PIN_NPM" <<'EOF'
+import json, re, sys
+reg, pid, pkg = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    entries = json.load(open(reg))["plugins"][pid]
+except Exception:
+    print("__NOPLUGIN__"); raise SystemExit
+# Prefer the user-scope install: that is the one a SessionStart hook sees.
+entries = sorted(entries, key=lambda e: e.get("scope") != "user")
+for e in entries:
+    path = e.get("installPath", "")
+    for name in (".claude-plugin/plugin.json", "plugin.json"):
+        try:
+            text = open("%s/%s" % (path, name)).read()
+        except Exception:
+            continue
+        # Scan raw text: the pin lives inside an args array, not a known key.
+        m = re.search(re.escape(pkg) + r"@(\d[A-Za-z0-9.\-+]*)", text)
+        print(m.group(1) if m else "__NOPIN__")
+        raise SystemExit
+print("__NOMANIFEST__")
+EOF
+)
+      case "$PIN_VER" in
+        __NOPLUGIN__)
+          FINDINGS+=("$LABEL: pin for '$PIN_NPM' — cannot verify (plugin '$PLUGIN' not in installed_plugins.json)") ;;
+        __NOMANIFEST__)
+          FINDINGS+=("$LABEL: pin for '$PIN_NPM' — cannot verify (no readable plugin manifest at the recorded installPath)") ;;
+        __NOPIN__)
+          # Declared coverage that matched nothing. Either the plugin dropped the
+          # pin (good — remove the key) or the package name is wrong (bad — the
+          # check has been silently inert). Both need a human; neither is a pass.
+          FINDINGS+=("$LABEL: no pin for '$PIN_NPM' found in the plugin manifest — pin_npm is watching nothing; drop the key or fix the package name") ;;
+        *)
+          PIN_CACHED=$(python3 - "$CACHE" "$PIN_NPM" <<'EOF'
+import json, sys, datetime as d
+try:
+    entry = json.load(open(sys.argv[1]))[sys.argv[2]]
+    checked = d.datetime.strptime(entry["checked"], "%Y-%m-%dT%H:%M:%SZ") \
+               .replace(tzinfo=d.timezone.utc)
+    age_h = (d.datetime.now(d.timezone.utc) - checked).total_seconds() / 3600
+    print("%s\x1f%.1f" % (entry["latest"], age_h))
+except Exception:
+    print("__NONE__")
+EOF
+)
+          if [ "$PIN_CACHED" = "__NONE__" ]; then
+            FINDINGS+=("$LABEL: pin '$PIN_NPM@$PIN_VER' — cannot verify (no cached registry data yet; refresh dispatched)")
+            NEED_REFRESH+=("$PIN_NPM")
+          else
+            IFS=$'\x1f' read -r PIN_LATEST PIN_AGE <<< "$PIN_CACHED"
+            PIN_STALE=$(python3 -c "print(1 if $PIN_AGE > ${NPM_TTL:-24} else 0)" 2>/dev/null || echo 0)
+            [ "$PIN_STALE" = "1" ] && NEED_REFRESH+=("$PIN_NPM")
+            PIN_NOTE=""
+            [ "$PIN_STALE" = "1" ] && PIN_NOTE=" (cache ${PIN_AGE}h old — stale, refresh dispatched)"
+            # Same direction rule as check 4: a pin AHEAD of the cached answer
+            # proves the cache is stale, not that the plugin rotted. Reporting it
+            # would advise a downgrade.
+            PIN_CMP=$(version_cmp "$PIN_VER" "$PIN_LATEST")
+            if [ "$PIN_CMP" = "1" ]; then
+              case " ${NEED_REFRESH[*]:-} " in
+                *" $PIN_NPM "*) : ;;
+                *) NEED_REFRESH+=("$PIN_NPM") ;;
+              esac
+            elif [ "$PIN_CMP" = "-1" ] || { [ "$PIN_CMP" = "__NC__" ] && [ "$PIN_VER" != "$PIN_LATEST" ]; }; then
+              FINDINGS+=("$LABEL: plugin manifest pins $PIN_NPM@$PIN_VER but npm latest is $PIN_LATEST — the plugin will keep spawning the pinned version; update the plugin or repin it$PIN_NOTE")
+            elif [ "$PIN_STALE" = "1" ]; then
+              FINDINGS+=("$LABEL: pin check is stale — cache ${PIN_AGE}h old, cannot confirm $PIN_NPM@$PIN_VER is still current (refresh dispatched)")
+            fi
+          fi ;;
+      esac
+    fi
+  fi
+
+  # 6. Coverage honesty about the watchlist ITSELF. Checks 1-5 report on what
   #    they were pointed at; none of them can notice being pointed at nothing.
   #    A `cli` with no `npm` key silently skips check 4 for that entry, so a
   #    half-covered watchlist reports exactly like a fully covered one.
