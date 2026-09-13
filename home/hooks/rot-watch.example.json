@@ -13,6 +13,9 @@
     "                 the pin is compared to the registry 'latest'. Needs a",
     "                 'plugin' key to locate the manifest, and REPORTS when it",
     "                 matches nothing rather than passing quietly.",
+    "  pin_files      extra file globs to scan for that same pin, beyond the",
+    "                 plugin manifest: CI workflows, Dockerfiles, scripts. '~'",
+    "                 expands to $HOME. A glob matching ZERO files is a finding.",
     "An EMPTY watch array is treated as a finding, not a pass \u2014 that is deliberate.",
     "",
     "Same reasoning one level up: an entry with a 'cli' but NO 'npm' key skips",
@@ -26,6 +29,10 @@
     "'some-pkg@1.2.3' inside an mcpServers command line and keep spawning 1.2.3",
     "forever while the local CLI floats to latest, with all four other checks green.",
     "That is what pin_npm watches. The pin sits in an args array rather than a named",
+    "pin_files is the same idea one layer out: a version written by hand in a repo",
+    "file. The manifest scan finds its target through the plugin's installPath, so a",
+    "CI workflow is structurally invisible to it \u2014 which is how a gate ran a whole",
+    "minor version behind everything else on the machine without a word.",
     "field, so the check scans the manifest text for '<package>@<version>'.",
     "",
     "The npm check never touches the network on the SessionStart path. It reads",
@@ -43,7 +50,10 @@
       "stale_days": 14,
       "npm": "example-tool-cli",
       "npm_ttl_hours": 24,
-      "pin_npm": "example-tool-cli"
+      "pin_npm": "example-tool-cli",
+      "pin_files": [
+        "~/Github/example-repo/.github/workflows/*.yml"
+      ]
     }
   ]
 }

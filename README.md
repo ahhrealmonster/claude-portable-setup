@@ -29,7 +29,7 @@ skipped file stays behind the bundle silently.
 | `home/ai-rules/global.md` | `~/.config/ai-rules/global.md` | The working rules, agent-agnostic — visual-first decisions, denominator checks, TDD, trail markers, PR-review verdicts, repo conventions, standard workflow. Every agent on the machine reads this one file |
 | `home/CLAUDE.md` | `~/.claude/CLAUDE.md` | Claude Code-specific mechanics only — the visual level dial, the siren, skill selection, worktree isolation, permission hygiene. Opens by `@import`ing the shared file above |
 | `home/skills/visual-decisions/` | `~/.claude/skills/` | Personal skill: render a visual before any non-trivial decision, with a latency/cost level dial |
-| `home/hooks/tooling-rot-siren.sh` | `~/.claude/hooks/` | SessionStart hook: catches degraded local tooling (missing/disabled plugin, stale marketplace checkout, CLI-vs-plugin version skew, a plugin manifest pinning a stale npm version) before work starts |
+| `home/hooks/tooling-rot-siren.sh` | `~/.claude/hooks/` | SessionStart hook: catches degraded local tooling (missing/disabled plugin, stale marketplace checkout, CLI-vs-plugin version skew, a plugin manifest or CI workflow pinning a stale npm version) before work starts |
 | `home/hooks/rot-watch.example.json` | `~/.claude/hooks/` | Watchlist config for the siren. No config = silent; a `cli` with no `npm` key = partial coverage, and it says so |
 | `home/hooks/statusline-context.sh` | `~/.claude/hooks/` | Statusline: live context gauge + this session's weighted token burn, read from the transcript's real usage records |
 | `home/hooks/clear-nudge.sh` | `~/.claude/hooks/` | PostToolUse hook: suggests `/clear` only when a commit/PR/merge/push has banked the work **and** context is already expensive |

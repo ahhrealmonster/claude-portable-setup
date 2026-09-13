@@ -400,6 +400,180 @@ OUT=$(run_siren)
 assert_has "needs a 'plugin'" "$OUT" "pin_npm without plugin → misconfiguration finding"
 teardown
 
+# ── fixture: files carrying a pin, outside any plugin ───────────────────────
+# The workflow-file case from #22: the pin lives in a repo file the plugin
+# machinery knows nothing about, so nothing derived from installPath can see it.
+pin_file() {
+  local rel="$1"
+  local pin="$2"
+  local p="$HOME/$rel"
+  mkdir -p "$(dirname "$p")"
+  printf 'jobs:\n  x:\n    steps:\n      - run: npm install -g %s\n' "$pin" > "$p"
+}
+
+# ── 29. a stale pin in a watched file is a finding ──────────────────────────
+# Issue #22 exactly: CI installs 6.4.0 while everything else is on 6.5.0, and
+# check 5 cannot see it because the pin is not in a plugin manifest.
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "6.4.0" "$OUT" "stale pin in a watched file → finding names the pin"
+assert_has "6.5.0" "$OUT" "  finding names the published version"
+assert_has "ci.yml" "$OUT" "  finding names the FILE, so it is actionable"
+teardown
+
+# ── 30. a current pin in a watched file is silent ───────────────────────────
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.5.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "file pin == npm latest → silent" \
+              || bad "file pin == npm latest → silent" "empty output" "$OUT"
+teardown
+
+# ── 31. THE ZERO DENOMINATOR: a glob matching no files ──────────────────────
+# The whole thesis of this hook. A glob that matches nothing checks nothing and
+# would otherwise report exactly like a glob that matched a clean file. Renaming
+# a workflow directory must not silently retire the check.
+setup
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "matched no files" "$OUT" "glob matching nothing → finding, not a pass"
+teardown
+
+# ── 32. files matched, but none mentions the package ───────────────────────
+# Declared coverage that found nothing. Either CI dropped the pin (good, remove
+# the key) or the package name is wrong (bad, the check has been inert).
+setup
+pin_file "repo/.github/workflows/ci.yml" "otherpkg@1.0.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "no pin for 'mypkg'" "$OUT" "files matched but package absent → reports"
+teardown
+
+# ── 33. two files disagreeing must both be named ───────────────────────────
+# #22 had the pin twice. Reporting only the first would leave a stale site behind
+# after a fix that looked complete.
+setup
+pin_file "repo/.github/workflows/a.yml" "mypkg@6.3.0"
+pin_file "repo/.github/workflows/b.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "6.3.0" "$OUT" "two disagreeing files → names the first version"
+assert_has "6.4.0" "$OUT" "  and the second"
+teardown
+
+# ── 34. the same pin repeated in one file reports once ─────────────────────
+# #22's real shape: one file, two identical `npm install -g pkg@X` lines. Two
+# findings for one fix is noise, and noise is what stops a siren being read.
+setup
+mkdir -p "$HOME/repo/.github/workflows"
+printf 'a: npm install -g mypkg@6.4.0\nb: npm install -g mypkg@6.4.0\n' \
+  > "$HOME/repo/.github/workflows/ci.yml"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+# Count inside systemMessage only: the hook repeats the same text in
+# additionalContext, so counting across the raw JSON doubles every match.
+N=$(printf '%s' "$OUT" | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['systemMessage'].count('6.4.0'))")
+[ "$N" = "1" ] && ok "same version twice in one file → one finding" \
+               || bad "same version twice in one file → one finding" "1 mention of 6.4.0" "$N mentions"
+teardown
+
+# ── 35. a pin AHEAD of the cache is not rot (direction rule holds here too) ─
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.6.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_not "6.6.0" "$OUT" "file pin ahead of cache → no rot finding, no downgrade advice"
+teardown
+
+# ── 36. pin_files without pin_npm names no package to look for ─────────────
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+OUT=$(run_siren)
+assert_has "needs a 'pin_npm'" "$OUT" "pin_files without pin_npm → misconfiguration finding"
+teardown
+
+# ── 37. pin_files works with NO plugin key ─────────────────────────────────
+# A repo's CI pins are not a plugin's business. Requiring `plugin` here would
+# force a bogus key just to reach the check.
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_not "needs a 'plugin'" "$OUT" "pin_files alone → no spurious plugin-key complaint"
+teardown
+
+# ── 38. manifest and files are watched together, reported separately ───────
+# One entry can carry both. They are different artifacts needing different
+# fixes, so collapsing them into one finding would hide a site.
+setup
+plugin_with_pin "plug@mkt" "mypkg@6.4.0"
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.3.0"
+config '{"watch":[{"plugin":"plug@mkt","pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "manifest pins mypkg@6.4.0" "$OUT" "manifest pin still reported alongside files"
+assert_has "6.3.0" "$OUT" "  file pin reported too"
+teardown
+
+# ── 39. the file check counts in the denominator ───────────────────────────
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+# One check ran: the file scan. There is no plugin here, so no manifest scan —
+# counting a check that could not run is the denominator padding this hook forbids.
+assert_has "across 1 check(s)" "$OUT" "pin_files increments CHECKS_RUN (by exactly one)"
+teardown
+
+# ── 40. a fresh cache must not touch the network on the file path either ───
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+run_siren >/dev/null
+npm_called && bad "file pin path → zero network calls" "npm never invoked" "$(cat "$TMP/npm-calls")" \
+           || ok "file pin path → zero network calls (hot path stays local)"
+teardown
+
+# ── 41. a pin-only entry still labels its finding ──────────────────────────
+# No plugin, cli, marketplace or npm key means every label candidate is empty,
+# and the finding renders as a bare "- :" naming nothing at all.
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_not "  - :" "$OUT" "pin-only entry → finding is labelled, not a bare dash"
+assert_has "mypkg:" "$OUT" "  falls back to the package name"
+teardown
+
+# ── 42. a scoped package name must not be mangled ──────────────────────────
+# The real package is @harness-engineering/cli — a leading @ and a slash. A
+# regex built by naive concatenation, or a glob-style match, breaks on both.
+setup
+mkdir -p "$HOME/repo/.github/workflows"
+printf 'run: npm install -g @scope/tool@6.4.0\n' > "$HOME/repo/.github/workflows/ci.yml"
+config '{"watch":[{"pin_npm":"@scope/tool","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"@scope/tool\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "@scope/tool@6.4.0" "$OUT" "scoped package name survives the scan"
+teardown
+
 # ── report ───────────────────────────────────────────────────────────────────
 printf '\n  %s────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 if [ "$FAIL" -eq 0 ]; then
