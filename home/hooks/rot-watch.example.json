@@ -9,14 +9,24 @@
     "  npm            npm package name; cached registry 'latest' vs the installed version",
     "  npm_ttl_hours  how old the cached registry answer may get, default 24",
     "  npm_exempt     true = this cli is deliberately not npm-checked (see below)",
-    "An EMPTY watch array is treated as a finding, not a pass — that is deliberate.",
+    "  pin_npm        npm package this PLUGIN hardcodes in its own manifest;",
+    "                 the pin is compared to the registry 'latest'. Needs a",
+    "                 'plugin' key to locate the manifest, and REPORTS when it",
+    "                 matches nothing rather than passing quietly.",
+    "An EMPTY watch array is treated as a finding, not a pass \u2014 that is deliberate.",
     "",
     "Same reasoning one level up: an entry with a 'cli' but NO 'npm' key skips",
     "the drift check silently, so a half-covered watchlist reports identically",
     "to a fully covered one. The siren therefore flags that entry as PARTIAL",
     "COVERAGE. If the CLI genuinely is not published to npm, say so with",
-    "\"npm_exempt\": true — silence is earned by declaring the gap, never granted",
+    "\"npm_exempt\": true \u2014 silence is earned by declaring the gap, never granted",
     "by omitting the key.",
+    "",
+    "Every other check inspects what the machine INSTALLED. A plugin can hardcode",
+    "'some-pkg@1.2.3' inside an mcpServers command line and keep spawning 1.2.3",
+    "forever while the local CLI floats to latest, with all four other checks green.",
+    "That is what pin_npm watches. The pin sits in an args array rather than a named",
+    "field, so the check scans the manifest text for '<package>@<version>'.",
     "",
     "The npm check never touches the network on the SessionStart path. It reads",
     "~/.claude/hooks/.rot-npm-cache.json and, when that is missing or older than",
@@ -32,7 +42,8 @@
       "cli": "example-tool",
       "stale_days": 14,
       "npm": "example-tool-cli",
-      "npm_ttl_hours": 24
+      "npm_ttl_hours": 24,
+      "pin_npm": "example-tool-cli"
     }
   ]
 }
