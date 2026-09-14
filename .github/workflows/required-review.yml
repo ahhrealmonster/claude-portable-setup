@@ -16,6 +16,10 @@
 # annotation, whether a review actually ran. The check stays green either way;
 # what it will not do is let "floor-only" look identical to "reviewed".
 #
+# The floor-only state is a DECLARED gap, not an accepted one: see EXEMPTIONS.md
+# for what this gate is and is not currently doing, and the one command that
+# turns the LLM tier on (`gh secret set ANTHROPIC_API_KEY`). Tracked in #17.
+#
 # The trigger is `pull_request`, never `pull_request_target`: a fork PR then
 # receives no secrets at all, so the LLM tier degrades to its heuristic floor on
 # outside contributions rather than handing an unreviewed branch the org's keys.

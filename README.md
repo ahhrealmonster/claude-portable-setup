@@ -38,7 +38,8 @@ skipped file stays behind the bundle silently.
 | `tools/check-drift.sh` | — | Read-only check that what's deployed still matches what's here. Exit 2 for "nothing installed" is distinct from exit 0 on purpose |
 | `tools/bare-install.sh` | — | Carries out `INSTALL.md` §§1–4 into a scratch `$HOME` and proves the install landed: exit 0, never the exit-2 abstention. Names the two targets it does not verify, pass or fail |
 | `.github/workflows/ci.yml` | — | The four gates on `ubuntu-latest` and `macos-latest`, plus an aggregate job that fails when a leg was *skipped* rather than run |
-| `tests/` | — | Executable regression tests for the three hooks, the drift check, and the bare install (133 cases across 5 suites). `./tests/run-all.sh` |
+| `EXEMPTIONS.md` | — | Gates this repo does **not** run, why, and the condition that expires each exemption. Guarded by a test, so a declaration cannot outlive its reason |
+| `tests/` | — | Executable regression tests for the three hooks, the drift check, the bare install, and the docs-coverage exemption (189 cases across 6 suites). `./tests/run-all.sh` |
 
 ## Where it's going
 
