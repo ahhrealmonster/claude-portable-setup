@@ -262,6 +262,10 @@ while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NP
   MKT="$CLAUDE_DIR/plugins/marketplaces/$MKT_NAME"
   PLUGIN_VER="unknown"
   CLI_VER="unknown"   # hoisted: the npm check below needs it even if no cli key
+  # Hoisted for two reasons: `set -u` would abort on an entry with no `plugin`
+  # key, and without an explicit reset the previous entry's installed versions
+  # would leak into this one and be reported against the wrong tool.
+  INSTALLED_VERS=""
 
   # 1. Plugin installed AND enabled. (A past failure: flat files bypassed the
   #    plugin system entirely, so nothing tracked versions at all.)
@@ -277,24 +281,103 @@ sys.exit(0 if d.get('enabledPlugins',{}).get('$PLUGIN') else 1)" 2>/dev/null; th
     fi
   fi
 
-  # 2. Marketplace checkout freshness. A stale checkout drifts silently.
+  # 2. Marketplace checkout freshness, measured from the record Claude Code
+  #    actually stamps — `known_marketplaces.json` → `lastUpdated` — and not
+  #    from a git mtime.
+  #
+  #    This used to `find .git/FETCH_HEAD -mtime +N`, which is fresh whenever
+  #    ANYONE fetched, a human running `git pull` by hand included; and when
+  #    FETCH_HEAD was absent it fell back to `.git/HEAD`, whose mtime moves on
+  #    checkout and commit and never on fetch. A checkout that had never been
+  #    refreshed therefore looked fresh forever. Observed live: a checkout 29
+  #    commits and 20 days behind, reported clean (#15).
+  #
+  #    No network, same as every other check here: this reads a local JSON
+  #    record rather than fetching to find out.
   if [ -n "$MKT_NAME" ]; then
     CHECKS_RUN=$((CHECKS_RUN + 1))
-    if [ -d "$MKT/.git" ]; then
-      LAST_FETCH="$MKT/.git/FETCH_HEAD"
-      [ -f "$LAST_FETCH" ] || LAST_FETCH="$MKT/.git/HEAD"
-      if [ -n "$(find "$LAST_FETCH" -mtime +"${STALE_DAYS:-14}" 2>/dev/null)" ]; then
-        FINDINGS+=("$LABEL: marketplace checkout not refreshed in >${STALE_DAYS:-14} days (claude plugin marketplace update $MKT_NAME)")
-      fi
-      PLUGIN_VER=$(python3 -c "
-import json;print(json.load(open('$MKT/.claude-plugin/plugin.json'))['version'])" 2>/dev/null || echo "unknown")
-    else
-      FINDINGS+=("$LABEL: marketplace checkout missing at $MKT")
+    MKT_AGE=$(python3 - "$CLAUDE_DIR/plugins/known_marketplaces.json" "$MKT_NAME" <<'EOF'
+import json, sys, datetime as d
+try:
+    entry = json.load(open(sys.argv[1]))[sys.argv[2]]
+    ts = entry["lastUpdated"].replace("Z", "+00:00")
+    when = d.datetime.fromisoformat(ts)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=d.timezone.utc)
+    age = (d.datetime.now(d.timezone.utc) - when).total_seconds() / 86400
+    # Whole days above a day: "30.00d" reads like false precision for something
+    # measured against a threshold expressed in whole days.
+    print("%d" % round(age) if age >= 1 else "%.1f" % age)
+except Exception:
+    print("__UNKNOWN__")   # absent, corrupt, or unparseable == no data, not fresh
+EOF
+)
+    if [ "$MKT_AGE" = "__UNKNOWN__" ]; then
+      # Silence here would make "never updated" and "updated this morning"
+      # indistinguishable — the abstention-as-pass shape, inside the hook whose
+      # whole job is catching it.
+      FINDINGS+=("$LABEL: marketplace '$MKT_NAME' freshness — cannot verify (no usable lastUpdated in known_marketplaces.json)")
+    elif [ "$(python3 -c "print(1 if $MKT_AGE > ${STALE_DAYS:-14} else 0)" 2>/dev/null || echo 0)" = "1" ]; then
+      # `claude plugin marketplace update`, never `install`: install no-ops on
+      # something already installed ("already installed") without upgrading it,
+      # so prescribing it sends the reader through a command that cannot fix
+      # what was just reported.
+      FINDINGS+=("$LABEL: marketplace checkout last updated ${MKT_AGE}d ago (>${STALE_DAYS:-14}) — run: claude plugin marketplace update $MKT_NAME")
+    fi
+    [ -d "$MKT/.git" ] || FINDINGS+=("$LABEL: marketplace checkout missing at $MKT")
+  fi
+
+  # 3. CLI presence, and CLI-vs-INSTALLED-plugin version skew.
+  #
+  #    The comparison basis moved. It used to read the marketplace checkout's
+  #    `.claude-plugin/plugin.json`, which is a different artifact from the
+  #    plugin that is actually installed and versions independently of it.
+  #    Observed live: npm CLI 7.1.0, checkout 7.0.0, installed 6.4.0 — the check
+  #    reported a one-release skew while a seven-release skew sat behind it,
+  #    unnamed, in the copy Claude Code actually loads from (#15).
+  #
+  #    installed_plugins.json is per-scope and can hold several entries at
+  #    different versions at once; all of them were populated in that incident,
+  #    so every distinct version is considered rather than just the first.
+  if [ -n "$PLUGIN" ]; then
+    INSTALLED_VERS=$(python3 - "$CLAUDE_DIR/plugins/installed_plugins.json" "$PLUGIN" <<'EOF'
+import json, sys
+try:
+    entries = json.load(open(sys.argv[1]))["plugins"][sys.argv[2]]
+except Exception:
+    raise SystemExit
+# User scope first: that is the one a SessionStart hook loads from.
+entries = sorted(entries, key=lambda e: e.get("scope") != "user")
+seen = []
+for e in entries:
+    v = e.get("version")
+    if v and (v, e.get("scope")) not in seen:
+        seen.append((v, e.get("scope")))
+for v, s in seen:
+    print("%s\x1f%s" % (v, s or "?"))
+EOF
+)
+    # PLUGIN_VER is what check 4 falls back to when no CLI reports a version, so
+    # it must be the installed one too — not the checkout's.
+    PLUGIN_VER=$(printf '%s' "$INSTALLED_VERS" | head -1 | cut -d$'\x1f' -f1)
+    PLUGIN_VER=${PLUGIN_VER:-unknown}
+
+    # Scopes disagreeing with EACH OTHER is a finding on its own, and does not
+    # need a CLI to notice. Live: canary@bop-clocktower at user 7.2.0 and
+    # project 6.4.0 twice — a project a major behind, invisible to every check
+    # because nothing compared the scopes.
+    DISTINCT=$(printf '%s' "$INSTALLED_VERS" | cut -d$'\x1f' -f1 | sort -u | grep -c . || true)
+    if [ "${DISTINCT:-0}" -gt 1 ]; then
+      # printf '%s\n', not '%s': command substitution strips the trailing
+      # newline, so `while read` fails on the final unterminated line and skips
+      # its body — dropping the LAST scope, which is the one most likely to be
+      # the stale one this finding exists to name.
+      SCOPE_LIST=$(printf '%s\n' "$INSTALLED_VERS" | while IFS=$'\x1f' read -r v sc; do
+        [ -n "$v" ] && printf '%s (%s), ' "$v" "$sc"; done)
+      FINDINGS+=("$LABEL: installed at ${DISTINCT} different versions across scopes — ${SCOPE_LIST%, }; the older scopes load stale code (claude plugin update $PLUGIN)")
     fi
   fi
 
-  # 3. CLI presence, and CLI-vs-plugin version skew. The CLI and the plugin
-  #    that drives it must move together or the plugin calls a stale surface.
   if [ -n "$CLI" ]; then
     CHECKS_RUN=$((CHECKS_RUN + 1))
     if command -v "$CLI" >/dev/null 2>&1; then
@@ -303,12 +386,22 @@ import json;print(json.load(open('$MKT/.claude-plugin/plugin.json'))['version'])
       # do not recognize --version and instead start up and read stdin to EOF.
       # Without this they drain the watchlist and every later entry is silently
       # skipped — a truncated denominator inside the denominator checker.
-      CLI_VER=$("$CLI" --version 2>/dev/null </dev/null | sed $'s/\x1b\\[[0-9;]*m//g' \
+      # 2>&1, not 2>/dev/null: plenty of CLIs print their version banner on
+      # STDERR. `canary --version` does exactly that, so capturing stdout alone
+      # produced "unknown" and SILENTLY skipped the skew comparison below —
+      # a check that does not run, reported identically to one that agreed.
+      CLI_VER=$("$CLI" --version 2>&1 </dev/null | sed $'s/\x1b\\[[0-9;]*m//g' \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
       CLI_VER=${CLI_VER:-unknown}
-      if [ "$PLUGIN_VER" != "unknown" ] && [ "$CLI_VER" != "unknown" ] \
-         && [ "$CLI_VER" != "$PLUGIN_VER" ]; then
-        FINDINGS+=("$LABEL: version skew — CLI $CLI_VER vs plugin $PLUGIN_VER; sync them")
+      if [ "$CLI_VER" = "unknown" ]; then
+        FINDINGS+=("$LABEL: CLI '$CLI' is on PATH but reports no parseable version — cannot verify skew against the installed plugin")
+      elif [ -n "$INSTALLED_VERS" ]; then
+        while IFS=$'\x1f' read -r IV ISCOPE; do
+          [ -z "$IV" ] && continue
+          if [ "$IV" != "$CLI_VER" ]; then
+            FINDINGS+=("$LABEL: version skew — CLI $CLI_VER vs INSTALLED plugin $IV ($ISCOPE scope); run: claude plugin update $PLUGIN")
+          fi
+        done <<< "$INSTALLED_VERS"
       fi
     else
       FINDINGS+=("$LABEL: CLI '$CLI' not on PATH")
