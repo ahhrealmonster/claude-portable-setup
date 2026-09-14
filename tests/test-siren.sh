@@ -574,6 +574,125 @@ OUT=$(run_siren)
 assert_has "@scope/tool@6.4.0" "$OUT" "scoped package name survives the scan"
 teardown
 
+# ── fixture: a real git repo whose checked-out branch and origin/main differ ─
+# No network: origin/main is faked with update-ref, which is exactly what the
+# check reads. Identity is passed per-command so the suite never depends on the
+# machine's git config.
+git_repo() {
+  local dir="$HOME/$1"; local wt_pin="$2"; local ref_pin="$3"
+  local G=(git -C "$dir" -c user.email=t@t -c user.name=t -c commit.gpgsign=false)
+  mkdir -p "$dir/.github/workflows"
+  git init -q -b main "$dir"
+  printf 'run: npm install -g %s\n' "$ref_pin" > "$dir/.github/workflows/ci.yml"
+  "${G[@]}" add -A; "${G[@]}" commit -qm base
+  # Pretend this commit is what origin/main points at.
+  "${G[@]}" update-ref refs/remotes/origin/main "$("${G[@]}" rev-parse HEAD)"
+  if [ "$wt_pin" != "$ref_pin" ]; then
+    "${G[@]}" checkout -qb feat/stale
+    printf 'run: npm install -g %s\n' "$wt_pin" > "$dir/.github/workflows/ci.yml"
+    "${G[@]}" add -A; "${G[@]}" commit -qm stale
+  fi
+}
+
+# ── 43. a stale checkout must not read as a stale REPO ─────────────────────
+# The #25 case. After the fix landed on main the siren kept reporting the old
+# pin, because the working dir sat on a branch that predated it. The finding
+# named a file and nothing else, so it was indistinguishable from "main is
+# broken" — and it would fire for anyone sitting on a feature branch, which is
+# most of the time. A siren that cries on a normal working state stops being read.
+setup
+git_repo "repo" "mypkg@6.4.0" "mypkg@6.5.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "checkout is behind" "$OUT" "stale checkout, fixed ref → framed as a checkout artifact"
+assert_has "feat/stale" "$OUT" "  names the branch actually responsible"
+assert_not "update the pin" "$OUT" "  does NOT prescribe editing an already-fixed pin"
+teardown
+
+# ── 43b. a detached checkout must not be reported as branch 'HEAD' ─────────
+# `rev-parse --abbrev-ref HEAD` returns the literal "HEAD" when detached instead
+# of failing, so a naive fallback names a branch that does not exist.
+setup
+git_repo "repo" "mypkg@6.4.0" "mypkg@6.5.0"
+git -C "$HOME/repo" checkout -q --detach 2>/dev/null
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_not "branch 'HEAD'" "$OUT" "detached checkout → not named as branch 'HEAD'"
+teardown
+
+# ── 44. genuinely stale on BOTH sides is still real rot ────────────────────
+# The reframing above must not swallow the case the check exists for.
+setup
+git_repo "repo" "mypkg@6.4.0" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "update the pin" "$OUT" "stale on branch AND ref → real rot, still prescribed"
+assert_not "checkout is behind" "$OUT" "  not excused as a checkout artifact"
+teardown
+
+# ── 45. a file outside any git repo reports exactly as before ──────────────
+# No repo means no ref to compare against; the check must degrade to its old
+# behaviour rather than going quiet.
+setup
+pin_file "loose/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/loose/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "update the pin" "$OUT" "non-git file → unchanged finding"
+assert_not "checkout is behind" "$OUT" "  no bogus branch framing"
+teardown
+
+# ── 46. an unresolvable comparison ref must not silence the finding ────────
+# Cannot-verify is a finding, not a skip: if the ref cannot be read we still know
+# the working tree is stale, and that much must survive.
+setup
+git_repo "repo" "mypkg@6.4.0" "mypkg@6.5.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"],"pin_ref":"origin/nonexistent"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "6.4.0" "$OUT" "unresolvable ref → still reports the stale worktree pin"
+assert_has "could not be read" "$OUT" "  and says the ref could not be read"
+teardown
+
+# ── 47. pin_ref overrides the default comparison ref ───────────────────────
+setup
+git_repo "repo" "mypkg@6.4.0" "mypkg@6.5.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"],"pin_ref":"main"}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "checkout is behind" "$OUT" "explicit pin_ref is honoured"
+assert_has "main" "$OUT" "  names the ref it compared against"
+teardown
+
+# ── 48. a clean worktree costs no git calls ────────────────────────────────
+# The ref comparison runs only when there is already a stale hit to explain.
+# Doing it eagerly would put git work on every SessionStart for every watched
+# file, which is the latency this hook refuses to add.
+setup
+git_repo "repo" "mypkg@6.5.0" "mypkg@6.5.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+printf '#!/bin/bash\necho "$@" >> "%s/git-calls"\nexec /usr/bin/git "$@"\n' "$TMP" > "$TMP/bin/git"
+chmod +x "$TMP/bin/git"
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "clean pin → silent" || bad "clean pin → silent" "empty" "$OUT"
+[ -f "$TMP/git-calls" ] && bad "clean pin → no git calls" "git never invoked" "$(cat "$TMP/git-calls")" \
+                        || ok "clean pin → zero git calls (ref check is lazy)"
+teardown
+
+# ── 49. git missing entirely must degrade, not crash or go silent ──────────
+setup
+pin_file "repo/.github/workflows/ci.yml" "mypkg@6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","pin_files":["~/repo/.github/workflows/*.yml"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+printf '#!/bin/bash\nexit 127\n' > "$TMP/bin/git"; chmod +x "$TMP/bin/git"
+OUT=$(run_siren)
+assert_has "6.4.0" "$OUT" "git unusable → the pin finding still reports"
+teardown
+
 # ── report ───────────────────────────────────────────────────────────────────
 printf '\n  %s────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 if [ "$FAIL" -eq 0 ]; then

@@ -126,6 +126,71 @@ EOF
 # alternative is an alert on every session, which trains you to ignore it.
 [ -f "$CONFIG" ] || exit 0
 
+
+# pin_ref_state <file> <pkg> <latest> [ref] → "<state>\x1f<branch>\x1f<ref>"
+#   rot     the comparison ref carries the same stale pin (or there is no repo /
+#           no git to ask) — the file genuinely needs editing
+#   behind  the ref already pins something current, so only this checkout is old
+#   noref   the file is in a repo but the ref would not resolve
+#
+# Called ONLY when a stale pin has already been found, so a clean machine pays
+# nothing for it. Every git call is local and read-only; none of them touch the
+# network, which is the same contract the npm side keeps.
+pin_ref_state() {
+  local file="$1" pkg="$2" latest="$3" ref="${4:-}"
+  local dir top branch rel text
+
+  command -v git >/dev/null 2>&1 || { printf 'rot\x1f\x1f'; return; }
+  # Resolve to a PHYSICAL path first. `rev-parse --show-toplevel` always answers
+  # with symlinks resolved, so on macOS (where $HOME sits under /var, a symlink
+  # to /private/var) the prefix strip below would silently fail to match and
+  # leave `rel` absolute — making every `git show` miss and every hit report as
+  # an unreadable ref.
+  dir=$(cd "$(dirname "$file")" 2>/dev/null && pwd -P) || { printf 'rot\x1f\x1f'; return; }
+  file="$dir/$(basename "$file")"
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || { printf 'rot\x1f\x1f'; return; }
+  [ -n "$top" ] || { printf 'rot\x1f\x1f'; return; }
+
+  # --abbrev-ref answers the literal string "HEAD" on a detached checkout rather
+  # than failing, so the || branch never fires and the finding would name a
+  # "branch 'HEAD'" that does not exist.
+  branch=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  # The noun travels WITH the value: a detached checkout has no branch name to
+  # slot into "branch '%s'", and forcing one there reads as gibberish.
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    branch="a detached checkout"
+  else
+    branch="branch '$branch'"
+  fi
+
+  # Default chain: whatever origin points at, else origin/main, else main. A
+  # repo with none of them is not a failure to report — it is a repo with no
+  # upstream to be behind, so there is nothing to distinguish and it is rot.
+  if [ -z "$ref" ]; then
+    for cand in "$(git -C "$top" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" origin/main main; do
+      [ -n "$cand" ] || continue
+      if git -C "$top" rev-parse --verify -q "$cand" >/dev/null 2>&1; then ref="$cand"; break; fi
+    done
+    [ -n "$ref" ] || { printf 'rot\x1f%s\x1f' "$branch"; return; }
+  elif ! git -C "$top" rev-parse --verify -q "$ref" >/dev/null 2>&1; then
+    printf 'noref\x1f%s\x1f%s' "$branch" "$ref"; return
+  fi
+
+  rel=${file#"$top"/}
+  text=$(git -C "$top" show "$ref:$rel" 2>/dev/null) || { printf 'noref\x1f%s\x1f%s' "$branch" "$ref"; return; }
+
+  # The ref's copy is "current" when it names the package at a version that is
+  # not behind the registry. Reusing version_cmp keeps one definition of behind.
+  local rv
+  rv=$(printf '%s' "$text" | grep -oE "$(printf '%s' "$pkg" | sed 's/[][\.*^$\/+?(){}|]/\\&/g')@[0-9][A-Za-z0-9.+-]*" \
+       | head -1 | sed "s|^.*@||")
+  if [ -n "$rv" ] && [ "$(version_cmp "$rv" "$latest")" != "-1" ]; then
+    printf 'behind\x1f%s\x1f%s' "$branch" "$ref"
+  else
+    printf 'rot\x1f%s\x1f%s' "$branch" "$ref"
+  fi
+}
+
 # ------------------------------------------------------------ read watchlist --
 # Each watch entry may set any subset of:
 #   plugin          plugin id, e.g. "mytool@my-marketplace"  (installed + enabled)
@@ -136,6 +201,9 @@ EOF
 #   npm_ttl_hours   how old the cached registry answer may get (default 24)
 #   npm_exempt      true = this cli is deliberately not npm-checked (see check 6)
 #   pin_npm         npm package a hardcoded version is watched for (check 5)
+#   pin_ref         git ref a stale pin_files hit is cross-checked against,
+#                   to tell a stale CHECKOUT from a stale REPO (default:
+#                   origin/main, then main). Only consulted on a hit.
 #   pin_files       extra file globs to scan for that pin, beyond the plugin
 #                   manifest — CI workflows, Dockerfiles, anything tracking a
 #                   version by hand. ~ expands to $HOME. (check 5)
@@ -158,6 +226,7 @@ for w in cfg.get("watch", []):
         "true" if w.get("npm_exempt") else "false",
         w.get("pin_npm", ""),
         "\x1e".join(w.get("pin_files") or []),
+        w.get("pin_ref", ""),
     ]))
 EOF
 )
@@ -184,7 +253,7 @@ fi
 # Read on FD 3, not stdin: children spawned in the loop body inherit stdin and
 # can consume it. Keeping the watchlist on its own descriptor makes the loop
 # structurally immune to that, regardless of what a watched command does.
-while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM PIN_FILES; do
+while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM PIN_FILES PIN_REF; do
   [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG$PIN_NPM$PIN_FILES" ] && continue
   # PIN_NPM last in the chain: an entry that watches only pinned files has no
   # plugin, cli, marketplace or npm key, and an empty label renders as a bare
@@ -487,7 +556,27 @@ EOF
               # means the cache is stale, not that the file rotted.
               FCMP=$(version_cmp "$FV" "$PIN_LATEST")
               if [ "$FCMP" = "-1" ] || { [ "$FCMP" = "__NC__" ] && [ "$FV" != "$PIN_LATEST" ]; }; then
-                FINDINGS+=("$LABEL: ${FP/#$HOME/$TILDE} pins $PIN_NPM@$FV but npm latest is $PIN_LATEST — update the pin (re-validate against it, never bump blind)$PIN_NOTE")
+                # A hit means the WORKING TREE is stale — which is not the same
+                # claim as "the repo is stale". After a fix lands on main, anyone
+                # still sitting on an older branch keeps matching here, and a
+                # finding that named only a file path could not tell the two
+                # apart (#25). So on a hit — and only on a hit, to keep git off
+                # the clean path entirely — ask the repo which case this is.
+                WHERE=$(pin_ref_state "$FP" "$PIN_NPM" "$PIN_LATEST" "$PIN_REF")
+                IFS=$'\x1f' read -r WSTATE WBRANCH WREF <<< "$WHERE"
+                case "$WSTATE" in
+                  behind)
+                    # The ref already carries a current pin, so there is nothing
+                    # to edit. Prescribing an edit here sends someone to fix a
+                    # file that is already correct on the branch that matters.
+                    FINDINGS+=("$LABEL: ${FP/#$HOME/$TILDE} pins $PIN_NPM@$FV (npm latest $PIN_LATEST) — this checkout is behind, not the repo: $WBRANCH predates the fix already on $WREF. Nothing to edit; switch or rebase$PIN_NOTE") ;;
+                  noref)
+                    FINDINGS+=("$LABEL: ${FP/#$HOME/$TILDE} pins $PIN_NPM@$FV but npm latest is $PIN_LATEST — update the pin (re-validate against it, never bump blind). Ref '$WREF' could not be read, so whether the repo is stale or only this checkout is unverified$PIN_NOTE") ;;
+                  *)
+                    # rot, or no git to ask: the file as it stands is stale and
+                    # the pin needs editing.
+                    FINDINGS+=("$LABEL: ${FP/#$HOME/$TILDE} pins $PIN_NPM@$FV but npm latest is $PIN_LATEST — update the pin (re-validate against it, never bump blind)$PIN_NOTE") ;;
+                esac
               fi
             done <<< "$PIN_HITS"
           fi ;;

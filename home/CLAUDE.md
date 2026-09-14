@@ -53,6 +53,11 @@ starts.
   `installPath` and so cannot see a CI workflow. Point a glob at the files
   (`~` expands). A glob matching zero files is a finding — otherwise renaming a
   directory retires the check silently, which is the zero denominator again.
+- **A `pin_files` hit is cross-checked against a git ref** (`pin_ref`, default
+  `origin/HEAD`→`origin/main`→`main`). It globs the working tree, so it sees the
+  checked-out branch; without the cross-check, "the repo is stale" and "you are
+  on an old branch" read identically. Only runs on a hit — a clean machine makes
+  no git calls.
 
 If the siren fires, surface it in the first message of the session and treat it
 as outranking new work — then **put it to the user as an `AskUserQuestion`

@@ -87,6 +87,7 @@ empty **will** report itself — coverage was intended and isn't there.
 | `npm_exempt` | *declares* that a `cli` is deliberately not npm-checked | no |
 | `pin_npm` | a version this **plugin hardcodes in its own manifest** vs the registry's `latest` | **cached only** |
 | `pin_files` | the same pin, in **files you name with a glob** — CI workflows, Dockerfiles, scripts | **cached only** |
+| `pin_ref` | git ref a stale `pin_files` hit is cross-checked against, to tell a stale *checkout* from a stale *repo* | no (local git) |
 
 `pin_npm` covers a blind spot the others share: they all inspect what the
 machine *installed*. A plugin can hardcode `some-pkg@1.2.3` inside an
@@ -125,6 +126,30 @@ Two ways it can come up empty, both reported:
 
 `pin_files` needs a `pin_npm` naming what to look for, but it does **not** need a
 `plugin` key — a repo's CI pins are nobody's plugin.
+
+#### It reads the working tree, so it cross-checks the ref
+
+The glob hits the filesystem, which means it sees **whatever branch is checked
+out** — not the repo's settled state. Sit on a feature branch that predates a pin
+fix and the file really does still say the old version.
+
+Reporting that as-is was wrong in a specific way: the finding named a file and
+nothing else, so "main is stale" and "you are on an old branch" looked identical,
+and the second fires for anyone mid-feature — which is most of the time.
+
+So on a hit, and **only** on a hit, the check asks git which case it is:
+
+- **The ref is stale too** → real rot. `update the pin`, as before.
+- **The ref already pins something current** → your checkout is behind, not the
+  repo. The finding says so, names the branch, and explicitly does *not* tell you
+  to edit a file that is already correct on `main`.
+- **The ref will not resolve** → the finding still reports the stale pin and adds
+  that it could not tell which case this is. Cannot-verify is a finding, not a
+  skip.
+
+`pin_ref` picks the ref; the default tries `origin/HEAD`, then `origin/main`,
+then `main`. Every call is local and read-only — no network, and nothing runs at
+all unless something was already found, so a clean machine pays nothing.
 
 The first three compare local things to each other, so a machine can be
 perfectly self-consistent and still be a year behind the registry. `npm` closes
