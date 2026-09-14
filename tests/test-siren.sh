@@ -693,6 +693,175 @@ OUT=$(run_siren)
 assert_has "6.4.0" "$OUT" "git unusable → the pin finding still reports"
 teardown
 
+# ── fixtures for #15 ────────────────────────────────────────────────────────
+# A marketplace checkout whose git mtimes say "fresh" while the record Claude
+# Code actually keeps says otherwise, and an installed-plugin registry that can
+# hold several scoped versions at once.
+marketplace() {
+  local name="$1" days_ago="$2"
+  local d="$HOME/.claude/plugins/marketplaces/$name"
+  mkdir -p "$d/.git" "$d/.claude-plugin"
+  touch "$d/.git/FETCH_HEAD" "$d/.git/HEAD"          # deliberately fresh mtimes
+  printf '{"name":"p","version":"%s"}' "${3:-9.9.9}" > "$d/.claude-plugin/plugin.json"
+  python3 - "$HOME/.claude/plugins/known_marketplaces.json" "$name" "$days_ago" <<'EOF'
+import datetime as d, json, os, sys
+p, name, days = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(open(p)) if os.path.exists(p) else {}
+if days != "absent":
+    when = d.datetime.now(d.timezone.utc) - d.timedelta(days=float(days))
+    cfg[name] = {"lastUpdated": when.strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+json.dump(cfg, open(p, "w"))
+EOF
+}
+
+# installed_plugins.json entries: "scope:version" pairs, so one call can build
+# the several-scopes-at-once shape that actually occurred.
+installed() {
+  local id="$1"; shift
+  python3 - "$HOME/.claude/plugins/installed_plugins.json" "$id" "$@" <<'EOF'
+import json, os, sys
+p, pid, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
+cfg = json.load(open(p)) if os.path.exists(p) else {}
+cfg.setdefault("version", 2).__class__
+cfg = {"version": 2, "plugins": cfg.get("plugins", {})}
+cfg["plugins"][pid] = [
+    {"scope": s, "version": v,
+     "installPath": "/tmp/%s/%s" % (pid.split("@")[0], v)}
+    for s, v in (x.split(":") for x in pairs)
+]
+json.dump(cfg, open(p, "w"))
+EOF
+  printf '{"enabledPlugins":{"%s":true}}' "$id" > "$HOME/.claude/settings.json"
+}
+
+# ── 50. staleness must come from the record, not from a git mtime ───────────
+# The #15 case. `find .git/FETCH_HEAD -mtime` says fresh whenever ANYONE fetched
+# — including a human running `git pull` by hand — and when FETCH_HEAD is absent
+# the old code fell back to `.git/HEAD`, whose mtime moves on checkout and commit
+# and never on fetch. So a checkout that was never refreshed looked fresh
+# forever. known_marketplaces.json is what Claude Code actually stamps.
+setup
+marketplace "mkt" 30
+config '{"watch":[{"marketplace":"mkt","stale_days":14}]}'
+OUT=$(run_siren)
+assert_has "last updated 30d ago" "$OUT" "30d since lastUpdated → stale, despite fresh git mtimes"
+teardown
+
+# ── 51. a recently-recorded update is silent ───────────────────────────────
+setup
+marketplace "mkt" 3
+config '{"watch":[{"marketplace":"mkt","stale_days":14}]}'
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "3d since lastUpdated → silent" \
+              || bad "3d since lastUpdated → silent" "empty output" "$OUT"
+teardown
+
+# ── 52. a marketplace with no record at all cannot be verified ─────────────
+# Silence here would mean "never updated" and "updated this morning" look the
+# same, which is the abstention-as-pass shape.
+setup
+marketplace "mkt" absent
+config '{"watch":[{"marketplace":"mkt","stale_days":14}]}'
+OUT=$(run_siren)
+assert_has "cannot verify" "$OUT" "no lastUpdated record → cannot-verify finding"
+teardown
+
+# ── 53. skew must name the INSTALLED plugin, not the checkout ──────────────
+# Three artifacts, three versions: npm CLI 7.1.0, checkout 7.0.0, installed
+# 6.4.0. The old check compared against the checkout and reported a 1-release
+# skew while a 7-release skew sat behind it, unnamed — and the installed copy is
+# the one Claude Code actually loads.
+setup
+marketplace "mkt" 1 "7.0.0"
+installed "p@mkt" "user:6.4.0"
+printf '#!/bin/bash\necho "p v7.1.0"\n' > "$TMP/bin/p"; chmod +x "$TMP/bin/p"
+config '{"watch":[{"plugin":"p@mkt","marketplace":"mkt","cli":"p","npm_exempt":true}]}'
+OUT=$(run_siren)
+assert_has "6.4.0" "$OUT" "skew names the INSTALLED version"
+assert_not "7.0.0" "$OUT" "  and not the marketplace checkout's version"
+teardown
+
+# ── 54. several scoped installs at once — none silently dropped ────────────
+# installed_plugins.json is per-scope and held user + two project entries at
+# three different versions simultaneously. Reporting only the first hides the
+# rest, and the oldest is the one most likely to matter.
+setup
+marketplace "mkt" 1 "7.0.0"
+installed "p@mkt" "user:7.1.0" "project:6.4.0"
+printf '#!/bin/bash\necho "p v7.1.0"\n' > "$TMP/bin/p"; chmod +x "$TMP/bin/p"
+config '{"watch":[{"plugin":"p@mkt","marketplace":"mkt","cli":"p","npm_exempt":true}]}'
+OUT=$(run_siren)
+assert_has "6.4.0" "$OUT" "multiple scoped installs → the divergent one is named"
+teardown
+
+# ── 55. one version across every scope, matching the CLI, is silent ────────
+setup
+marketplace "mkt" 1 "7.0.0"
+installed "p@mkt" "user:7.1.0" "project:7.1.0"
+printf '#!/bin/bash\necho "p v7.1.0"\n' > "$TMP/bin/p"; chmod +x "$TMP/bin/p"
+config '{"watch":[{"plugin":"p@mkt","marketplace":"mkt","cli":"p","npm_exempt":true}]}'
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "all scopes agree with the CLI → silent" \
+              || bad "all scopes agree with the CLI → silent" "empty output" "$OUT"
+teardown
+
+# ── 56. the remediation is `update`, not `install` ─────────────────────────
+# `claude plugin install <name>` no-ops on an already-installed plugin
+# ("already installed") without upgrading it, so a finding that prescribes it
+# sends the reader through a command that cannot fix what was reported.
+setup
+marketplace "mkt" 30
+config '{"watch":[{"marketplace":"mkt","stale_days":14}]}'
+OUT=$(run_siren)
+assert_has "marketplace update" "$OUT" "stale marketplace → prescribes an update command"
+teardown
+
+# ── 57. a CLI that banners to stderr must still be read ────────────────────
+# Live case: `canary --version` prints "canary v7.2.0" to STDERR, and the check
+# captured stdout only. CLI_VER came back "unknown", which silently SKIPS the
+# skew comparison — the check reports nothing and looks identical to agreement.
+setup
+marketplace "mkt" 1 "7.0.0"
+installed "p@mkt" "user:6.4.0"
+printf '#!/bin/bash\necho "p v7.1.0" >&2\n' > "$TMP/bin/p"; chmod +x "$TMP/bin/p"
+config '{"watch":[{"plugin":"p@mkt","marketplace":"mkt","cli":"p","npm_exempt":true}]}'
+OUT=$(run_siren)
+assert_has "7.1.0" "$OUT" "version on stderr → still parsed"
+assert_has "6.4.0" "$OUT" "  and compared against the installed plugin"
+teardown
+
+# ── 58. a CLI on PATH with no readable version is cannot-verify ────────────
+# Skipping quietly means "versions agree" and "we never found out" render the
+# same. The skew check is the thing being abstained from, so say so.
+setup
+installed "p@mkt" "user:6.4.0"
+printf '#!/bin/bash\necho "no version here"\n' > "$TMP/bin/p"; chmod +x "$TMP/bin/p"
+config '{"watch":[{"plugin":"p@mkt","cli":"p","npm_exempt":true}]}'
+OUT=$(run_siren)
+assert_has "cannot verify" "$OUT" "unparseable CLI version → cannot-verify, not silence"
+teardown
+
+# ── 59. several scopes at different versions is itself a finding ───────────
+# Live: canary@bop-clocktower installed at user 7.2.0 and project 6.4.0 twice.
+# Nothing compared the scopes to each other, so a project sitting a major behind
+# was invisible whether or not a CLI version existed.
+setup
+installed "p@mkt" "user:7.2.0" "project:6.4.0"
+config '{"watch":[{"plugin":"p@mkt","npm_exempt":true}]}'
+OUT=$(run_siren)
+assert_has "7.2.0" "$OUT" "scopes disagree → finding names the newer version"
+assert_has "6.4.0" "$OUT" "  and the older one"
+teardown
+
+# ── 60. one version across all scopes is not a disagreement ───────────────
+setup
+installed "p@mkt" "user:7.2.0" "project:7.2.0"
+config '{"watch":[{"plugin":"p@mkt","npm_exempt":true}]}'
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "all scopes on one version → silent" \
+              || bad "all scopes on one version → silent" "empty output" "$OUT"
+teardown
+
 # ── report ───────────────────────────────────────────────────────────────────
 printf '\n  %s────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 if [ "$FAIL" -eq 0 ]; then
