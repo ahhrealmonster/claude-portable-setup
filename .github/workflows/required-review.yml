@@ -58,9 +58,9 @@ jobs:
       # pinned, an upgrade is a reviewable diff instead of a silent event. Bump
       # deliberately, and keep it equal to the version the local rot-watch
       # tracks — two gates on different CLI builds make a disagreement between
-      # them unattributable (#18). 12.8.0 is the version these gates were
+      # them unattributable (#18). 12.9.0 is the version these gates were
       # validated against.
-      - run: npm install -g @harness-engineering/cli@12.8.0
+      - run: npm install -g @harness-engineering/cli@12.9.0
       - name: Multi-persona review gate
         # HARDENED (2/2): the secrets live on this step, not on the job. The
         # scaffold put them in job-level `env`, which handed all five to
@@ -130,7 +130,7 @@ jobs:
           node-version: '22'
       # HARDENED (1/2): see the note in `required-review`. Keep both pins on the
       # same version.
-      - run: npm install -g @harness-engineering/cli@12.8.0
+      - run: npm install -g @harness-engineering/cli@12.9.0
       - name: Outcome-eval ship gate
         # Judges the change against its spec; blocks only on a high-confidence
         # NOT_SATISFIED. Auto-discovers the spec from the diff. With no spec or
