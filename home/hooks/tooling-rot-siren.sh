@@ -207,6 +207,11 @@ pin_ref_state() {
 #   pin_files       extra file globs to scan for that pin, beyond the plugin
 #                   manifest — CI workflows, Dockerfiles, anything tracking a
 #                   version by hand. ~ expands to $HOME. (check 5)
+#   stamp_files     file globs holding a RATCHET BASELINE that records which
+#                   analyzer version measured it. ~ expands to $HOME. Needs
+#                   pin_npm (the package to resolve) and stamp_key. (check 5c)
+#   stamp_key       JSON key inside those files holding that version string,
+#                   e.g. "harnessCli". (check 5c)
 WATCH=$(python3 - "$CONFIG" <<'EOF'
 import json, sys
 try:
@@ -227,6 +232,8 @@ for w in cfg.get("watch", []):
         w.get("pin_npm", ""),
         "\x1e".join(w.get("pin_files") or []),
         w.get("pin_ref", ""),
+        "\x1e".join(w.get("stamp_files") or []),
+        w.get("stamp_key", ""),
     ]))
 EOF
 )
@@ -253,8 +260,8 @@ fi
 # Read on FD 3, not stdin: children spawned in the loop body inherit stdin and
 # can consume it. Keeping the watchlist on its own descriptor makes the loop
 # structurally immune to that, regardless of what a watched command does.
-while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM PIN_FILES PIN_REF; do
-  [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG$PIN_NPM$PIN_FILES" ] && continue
+while IFS=$'\x1f' read -r -u 3 PLUGIN MKT_NAME CLI STALE_DAYS NPM_PKG NPM_TTL NPM_EXEMPT PIN_NPM PIN_FILES PIN_REF STAMP_FILES STAMP_KEY; do
+  [ -z "$PLUGIN$MKT_NAME$CLI$NPM_PKG$PIN_NPM$PIN_FILES$STAMP_FILES" ] && continue
   # PIN_NPM last in the chain: an entry that watches only pinned files has no
   # plugin, cli, marketplace or npm key, and an empty label renders as a bare
   # "- :" that names nothing.
@@ -520,13 +527,14 @@ EOF
   #     The pin is buried in an args array, not a top-level field, so this scans
   #     the manifest TEXT for `<pkg>@<version>` rather than reading a known key.
   #
-  #     Skipped without complaint when pin_files is set: watching repo files and
-  #     no plugin is a legitimate configuration, and demanding a bogus `plugin`
-  #     key to reach the check would be a misconfiguration of our own making.
-  if [ -n "$PIN_NPM" ] && { [ -n "$PLUGIN" ] || [ -z "$PIN_FILES" ]; }; then
+  #     Skipped without complaint when pin_files or stamp_files is set: watching
+  #     repo files and no plugin is a legitimate configuration, and demanding a
+  #     bogus `plugin` key to reach the check would be a misconfiguration of our
+  #     own making.
+  if [ -n "$PIN_NPM" ] && { [ -n "$PLUGIN" ] || [ -z "$PIN_FILES$STAMP_FILES" ]; }; then
     CHECKS_RUN=$((CHECKS_RUN + 1))
     if [ -z "$PLUGIN" ]; then
-      FINDINGS+=("$LABEL: pin_npm '$PIN_NPM' needs a 'plugin' key to locate the manifest (or a 'pin_files' glob); pin NOT checked")
+      FINDINGS+=("$LABEL: pin_npm '$PIN_NPM' needs a 'plugin' key to locate the manifest (or a 'pin_files' / 'stamp_files' glob); pin NOT checked")
     else
       PIN_VER=$(python3 - "$CLAUDE_DIR/plugins/installed_plugins.json" "$PLUGIN" "$PIN_NPM" <<'EOF'
 import json, re, sys
@@ -672,6 +680,95 @@ EOF
                 esac
               fi
             done <<< "$PIN_HITS"
+          fi ;;
+      esac
+    fi
+  fi
+
+  # 5c. A RATCHET BASELINE's instrument stamp, against the version the pin
+  #     actually resolves to. Structurally unlike 5a/5b: those look for
+  #     `pkg@version` in text, and a stamp is a JSON field holding a bare
+  #     version string, so neither of them can see it.
+  #
+  #     canary #1048, ten occurrences. A ratchet ceiling is only comparable to a
+  #     count produced by the SAME analyzer, so the baseline records which
+  #     version measured it. CI pins that analyzer to a floating MAJOR, so the
+  #     pin resolves forward by itself while the stamp stays put — and the
+  #     ratchet, correctly, abstains rather than compare across instruments.
+  #     `validate` then goes red on EVERY open PR at once and stays red until a
+  #     human lands a restamp by hand. Eight of the last nine restamps did not
+  #     move the number at all.
+  #
+  #     The cost is not one PR, and the discovery is whoever happens to have one
+  #     open. Exactly one occurrence was cheap: the time this siren noticed
+  #     first. That is the whole case for the check — it turns a merge-queue
+  #     outage into a line at session start, before anything is red.
+  if [ -n "$STAMP_FILES" ]; then
+    CHECKS_RUN=$((CHECKS_RUN + 1))
+    if [ -z "$PIN_NPM" ]; then
+      FINDINGS+=("$LABEL: stamp_files is set but needs a 'pin_npm' key naming the package whose resolved version the stamps are compared against; nothing was checked")
+    elif [ -z "$STAMP_KEY" ]; then
+      FINDINGS+=("$LABEL: stamp_files is set but needs a 'stamp_key' key naming the JSON field that holds the version; nothing was scanned")
+    else
+      STAMP_HITS=$(python3 - "$STAMP_KEY" "$STAMP_FILES" <<'EOF'
+import glob, json, os, sys
+key, spec = sys.argv[1], sys.argv[2]
+matched, out = False, []
+for g in spec.split("\x1e"):
+    if not g:
+        continue
+    for path in sorted(glob.glob(os.path.expanduser(g))):
+        if not os.path.isfile(path):
+            continue
+        matched = True
+        try:
+            data = json.load(open(path, errors="replace"))
+        except Exception:
+            # An unreadable baseline is not an agreeing one. Reporting it as a
+            # hit with no version would compare against an empty string.
+            out.append("__UNREADABLE__\x1f%s" % path)
+            continue
+        ver = data.get(key) if isinstance(data, dict) else None
+        if isinstance(ver, str) and ver:
+            out.append("%s\x1f%s" % (ver, path))
+if not matched:
+    print("__NOMATCH__")          # a glob matching nothing checked nothing
+elif not out:
+    print("__NOKEY__")            # files read, key absent from all of them
+else:
+    print("\n".join(out))
+EOF
+)
+      case "$STAMP_HITS" in
+        __NOMATCH__)
+          # Same zero denominator as 5b: move the baselines and the check
+          # retires itself with no sign that it did.
+          FINDINGS+=("$LABEL: stamp_files matched no files, so the '$STAMP_KEY' stamp was NOT checked — fix the glob or drop the key") ;;
+        __NOKEY__)
+          # A renamed field must not read as an up-to-date stamp.
+          FINDINGS+=("$LABEL: no '$STAMP_KEY' key found in any file matched by stamp_files — the check is watching nothing; fix the key name or drop it") ;;
+        *)
+          if [ "$PIN_LATEST" = "__NONE__" ]; then
+            FINDINGS+=("$LABEL: '$STAMP_KEY' stamps found but — cannot verify (no cached registry data yet; refresh dispatched)")
+            NEED_REFRESH+=("$PIN_NPM")
+          else
+            TILDE='~'
+            while IFS=$'\x1f' read -r SV SP; do
+              [ -z "$SV" ] && continue
+              if [ "$SV" = "__UNREADABLE__" ]; then
+                FINDINGS+=("$LABEL: ${SP/#$HOME/$TILDE} could not be parsed as JSON, so its '$STAMP_KEY' stamp was NOT checked")
+                continue
+              fi
+              # Same direction rule as 4, 5a and 5b: a stamp AHEAD of the cached
+              # answer means the cache is stale, not that the baseline rotted.
+              SCMP=$(version_cmp "$SV" "$PIN_LATEST")
+              if [ "$SCMP" = "-1" ] || { [ "$SCMP" = "__NC__" ] && [ "$SV" != "$PIN_LATEST" ]; }; then
+                # Name the consequence, not just the difference. "Two strings
+                # differ" gets scrolled past; "every open PR is about to go red"
+                # is why this is worth reading at session start.
+                FINDINGS+=("$LABEL: ${SP/#$HOME/$TILDE} stamps $STAMP_KEY $SV but $PIN_NPM now resolves to $PIN_LATEST — the ratchet will abstain and red every open PR until it is restamped. Re-measure on a clean worktree and update the stamp in the SAME PR; never raise the ceiling to clear it$PIN_NOTE")
+              fi
+            done <<< "$STAMP_HITS"
           fi ;;
       esac
     fi

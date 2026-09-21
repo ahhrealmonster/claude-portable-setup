@@ -57,6 +57,15 @@
       "pin_files": [
         "~/Github/example-repo/.github/workflows/*.yml"
       ]
+    },
+    {
+      "_comment": "Check 5c: a RATCHET BASELINE's instrument stamp, against the version pin_npm actually resolves to. Structurally different from pin_files above, which looks for 'pkg@version' in text -- a stamp is a JSON field holding a bare version string, so no text scan can see it. The case (canary #1048, ten occurrences): CI pins the analyzer to a floating MAJOR, the pin resolves forward on its own, the baseline stamp does not follow, and the ratchet correctly ABSTAINS rather than compare a count against a ceiling measured with a different instrument -- reddening every open PR at once until a human restamps by hand. Exactly one of those ten was cheap: the time this siren noticed first. Needs all three keys: pin_npm names the package to resolve, stamp_key the JSON field, stamp_files the baselines. List EVERY stamped baseline -- they move together, and a finding naming one sends someone to do half the restamp.",
+      "pin_npm": "@example-engineering/cli",
+      "stamp_key": "exampleCli",
+      "stamp_files": [
+        "~/Github/example-repo/.harness/entropy-baseline.json",
+        "~/Github/example-repo/.harness/perf-baseline.json"
+      ]
     }
   ]
 }
