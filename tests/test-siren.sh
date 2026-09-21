@@ -862,6 +862,95 @@ OUT=$(run_siren)
               || bad "all scopes on one version → silent" "empty output" "$OUT"
 teardown
 
+# ── fixture: a ratchet baseline stamping the instrument it was measured with ──
+# canary #1048. A ratchet ceiling is only comparable to a count produced by the
+# SAME analyzer, so the baseline records which version measured it. CI pins the
+# analyzer to a floating major, so the pin resolves forward on its own and the
+# stamp does not follow — at which point the ratchet correctly abstains and reds
+# every open PR at once. Ten occurrences before anything watched for it.
+stamp_file() {
+  local rel="$1" key="$2" ver="$3"
+  local p="$HOME/$rel"
+  mkdir -p "$(dirname "$p")"
+  printf '{"maxFindings":145,"measuredCount":144,"%s":"%s"}\n' "$key" "$ver" > "$p"
+}
+
+# ── 61. a stamp behind the resolved pin is a finding ───────────────────────
+# THE #1048 case, caught at the cheap moment: before a PR goes red, not by
+# whoever happens to have one open.
+setup
+stamp_file "repo/.harness/entropy-baseline.json" "harnessCli" "6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","stamp_key":"harnessCli","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "6.4.0" "$OUT" "stale ratchet stamp → finding names the stamp"
+assert_has "6.5.0" "$OUT" "  and the version the pin now resolves to"
+assert_has "entropy-baseline.json" "$OUT" "  and the FILE to restamp"
+assert_has "abstain" "$OUT" "  and says what happens next, not just that they differ"
+teardown
+
+# ── 62. a stamp matching the resolved pin is silent ────────────────────────
+setup
+stamp_file "repo/.harness/entropy-baseline.json" "harnessCli" "6.5.0"
+config '{"watch":[{"pin_npm":"mypkg","stamp_key":"harnessCli","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+[ -z "$OUT" ] && ok "stamp == resolved pin → silent" \
+              || bad "stamp == resolved pin → silent" "empty output" "$OUT"
+teardown
+
+# ── 63. EVERY stale stamp is named, not just the first ─────────────────────
+# The restamp is mechanical but it has to touch BOTH baselines; #1048 records
+# the entropy and perf stamps moving together every time. A finding that named
+# one file would send someone to do half the job and call it done.
+setup
+stamp_file "repo/.harness/entropy-baseline.json" "harnessCli" "6.4.0"
+stamp_file "repo/.harness/perf-baseline.json"    "harnessCli" "6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","stamp_key":"harnessCli","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "entropy-baseline.json" "$OUT" "two stale stamps → names the entropy baseline"
+assert_has "perf-baseline.json" "$OUT" "  AND the perf baseline"
+teardown
+
+# ── 64. THE ZERO DENOMINATOR: a stamp glob matching no files ───────────────
+# Same thesis as case 31. Move the baselines and the check retires itself.
+setup
+config '{"watch":[{"pin_npm":"mypkg","stamp_key":"harnessCli","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "matched no files" "$OUT" "stamp glob matching nothing → reports itself"
+teardown
+
+# ── 65. a matched file that lacks the key is watching nothing ──────────────
+# A renamed field is indistinguishable from an up-to-date stamp if absence
+# reads as agreement.
+setup
+stamp_file "repo/.harness/entropy-baseline.json" "someOtherKey" "6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","stamp_key":"harnessCli","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "harnessCli" "$OUT" "key absent from every matched file → names the key"
+assert_has "watching nothing" "$OUT" "  and says the check is inert"
+teardown
+
+# ── 66. stamp_files without stamp_key scans for nothing ────────────────────
+setup
+stamp_file "repo/.harness/entropy-baseline.json" "harnessCli" "6.4.0"
+config '{"watch":[{"pin_npm":"mypkg","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+cache "{\"mypkg\":{\"latest\":\"6.5.0\",\"checked\":\"$(hours_ago 1)\"}}"
+OUT=$(run_siren)
+assert_has "stamp_key" "$OUT" "stamp_files without stamp_key → misconfiguration finding"
+teardown
+
+# ── 67. stamp_files without pin_npm names no package to resolve ────────────
+setup
+stamp_file "repo/.harness/entropy-baseline.json" "harnessCli" "6.4.0"
+config '{"watch":[{"stamp_key":"harnessCli","stamp_files":["~/repo/.harness/*-baseline.json"]}]}'
+OUT=$(run_siren)
+assert_has "pin_npm" "$OUT" "stamp_files without pin_npm → misconfiguration finding"
+teardown
+
 # ── report ───────────────────────────────────────────────────────────────────
 printf '\n  %s────────────────────────────────────────%s\n' "$C_DIM" "$C_OFF"
 if [ "$FAIL" -eq 0 ]; then
